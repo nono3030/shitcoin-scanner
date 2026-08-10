@@ -1,23 +1,24 @@
 # Fly.io app config — shitcoin-scanner
-# Docs: https://fly.io/docs/reference/configuration/
+# IMPORTANT: do NOT use the empty "fly launch plan propose" wizard without
+# a local checkout. From the repo root (where Dockerfile lives):
 #
-# Deploy web dashboard:
-#   fly launch --no-deploy   # if first time (or use existing app name)
-#   fly volumes create scanner_data --region cdg --size 1
-#   fly secrets set BYBIT_API_KEY=... BYBIT_API_SECRET=...
-#   fly deploy
+#   fly apps create shitcoin-scanner -o <your-org>
+#   fly volumes create scanner_data --region fra --size 1 -a shitcoin-scanner
+#   fly secrets set BYBIT_API_KEY=... BYBIT_API_SECRET=... -a shitcoin-scanner
+#   fly deploy -a shitcoin-scanner --dockerfile Dockerfile
 #
-# Daily cron (post-close UTC) — one-shot scheduled machine from same image:
-#   fly machine run . --region cdg --schedule "15 0 * * *" \
-#     --env DATA_ROOT=/data \
-#     --command "python run_daily.py --no-refresh --skip-dashboard" \
-#     --volume scanner_data:/data
+# Cron later:
+#   fly machine run . -a shitcoin-scanner --region fra --schedule "15 0 * * *" \
+#     --env DATA_ROOT=/data --command "sh scripts/fly_daily.sh" \
+#     --volume scanner_data:/data --restart no
 
 app = "shitcoin-scanner"
-primary_region = "cdg"
+primary_region = "fra"
 
 [build]
+  # Explicit — required so Fly never "detects" empty source
   dockerfile = "Dockerfile"
+  ignorefile = ".dockerignore"
 
 [env]
   DATA_ROOT = "/data"
@@ -46,9 +47,8 @@ primary_region = "cdg"
   cpu_kind = "shared"
   cpus = 1
 
-# Persistent state: live book, OHLC cache, logs
-# Create once: fly volumes create scanner_data --region cdg --size 1
+# Create once before first deploy:
+#   fly volumes create scanner_data --region fra --size 1 -a shitcoin-scanner
 [mounts]
   source = "scanner_data"
   destination = "/data"
-  initial_size = "1gb"

@@ -3,35 +3,57 @@
 Fly ne détectait rien car le repo n’avait **ni Dockerfile ni framework**.  
 Ajoutés : `Dockerfile`, `requirements.txt`, `fly.toml`.
 
+## ⚠️ Ne pas utiliser le wizard `fly launch plan propose`
+
+L’erreur :
+`Could not find a Dockerfile, nor detect a runtime`
+arrive quand Fly analyse un **contexte vide** (UI web / plan propose sans checkout local).
+
+**Le Dockerfile est à la racine du repo** (commit `5b6af6c`+).  
+Deploy **depuis le clone local** avec `fly deploy --dockerfile Dockerfile`.
+
 ## 1. Prérequis
 
 ```powershell
 # CLI: https://fly.io/docs/hands-on/install-flyctl/
 fly auth login
 cd C:\Users\arnau\shitcoin-scanner
+git pull
+dir Dockerfile   # DOIT exister — sinon mauvais dossier
 ```
 
-## 2. Premier deploy (dashboard)
+## 2. Deploy sans wizard (recommandé)
 
 ```powershell
-# Si l’app existe déjà partiellement, skip launch et:
-fly volumes create scanner_data --region cdg --size 1
+cd C:\Users\arnau\shitcoin-scanner
+git pull
 
-# Secrets Bybit (ne jamais commit)
-fly secrets set BYBIT_API_KEY="xxx" BYBIT_API_SECRET="yyy"
+# une fois
+fly apps create shitcoin-scanner
+fly volumes create scanner_data --region fra --size 1 -a shitcoin-scanner
+fly secrets set BYBIT_API_KEY="xxx" BYBIT_API_SECRET="yyy" -a shitcoin-scanner
 
-fly deploy
-fly apps open
+# chaque release
+fly deploy -a shitcoin-scanner --dockerfile Dockerfile --remote-only
+fly apps open -a shitcoin-scanner
 ```
 
-Si `fly launch` redemande un plan :
+Ou script :
 
 ```powershell
-fly launch --no-deploy --copy-config --name shitcoin-scanner --region cdg
-fly volumes create scanner_data --region cdg --size 1
-fly secrets set BYBIT_API_KEY="..." BYBIT_API_SECRET="..."
-fly deploy
+powershell -ExecutionPolicy Bypass -File .\scripts\fly_deploy.ps1 -CreateApp
 ```
+
+## 2b. Si tu avais déjà lancé un launch cassé
+
+```powershell
+cd C:\Users\arnau\shitcoin-scanner
+git pull
+# ignore le wizard ; force le Dockerfile
+fly deploy -a shitcoin-scanner --dockerfile Dockerfile --remote-only
+```
+
+Si l’app n’existe pas encore : `fly apps create shitcoin-scanner` puis volume + secrets + deploy.
 
 ## 3. Cron daily (trading, post-close)
 
