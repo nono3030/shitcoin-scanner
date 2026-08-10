@@ -1364,9 +1364,32 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        # Fly/Railway health — never block on Kraken/Bybit
+        if path in ("/health", "/healthz"):
+            body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path in ("/", "/dashboard.html", "/index.html"):
-            write_dashboard(auto_refresh=True, use_ohlc=True)
-            body = DASH_HTML.read_bytes()
+            # Prefer cache; avoid multi-minute download on every request
+            try:
+                from config import CACHE_FILE
+
+                use_ohlc = CACHE_FILE.exists()
+            except Exception:
+                use_ohlc = False
+            try:
+                write_dashboard(auto_refresh=True, use_ohlc=use_ohlc)
+            except Exception as e:
+                print(f"dashboard regen warn: {e}")
+            if DASH_HTML.exists():
+                body = DASH_HTML.read_bytes()
+            else:
+                body = b"<html><body><h1>Dashboard loading...</h1><p>OHLC cache warming.</p></body></html>"
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1375,7 +1398,13 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path in ("/data.json", "/api/live", "/live.json"):
-            data = build_payload(use_ohlc=(path == "/data.json"))
+            try:
+                from config import CACHE_FILE
+
+                use_ohlc = CACHE_FILE.exists() and path == "/data.json"
+            except Exception:
+                use_ohlc = False
+            data = build_payload(use_ohlc=use_ohlc)
             # without full candles for lightness
             slim = {k: v for k, v in data.items() if k != "charts"}
             body = json.dumps(slim, default=str).encode()
@@ -1405,13 +1434,41 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(open_browser: bool = True, host: str | None = None, port: int | None = None) -> None:
+    """
+    Bind HTTP immediately so Fly/Railway health checks pass.
+    First HTML is generated without blocking on full Kraken OHLC download;
+    charts hydrate on request / background warm if cache missing.
+    """
+    import threading
+
     host = host or BIND_HOST
     port = int(port or PORT)
-    write_dashboard(auto_refresh=True)
+
+    # Fast path: never block bind on full universe download
+    try:
+        from config import CACHE_FILE
+
+        has_cache = CACHE_FILE.exists()
+    except Exception:
+        has_cache = False
+    write_dashboard(auto_refresh=True, use_ohlc=has_cache)
+
     httpd = ThreadingHTTPServer((host, port), Handler)
     url = f"http://{host}:{port}/"
     print(f"Dashboard + charts → {url} (bind={host})")
     print("Ctrl+C pour arrêter.")
+
+    if not has_cache:
+        def _warm() -> None:
+            try:
+                print("Background: warming OHLC cache (first boot)...")
+                write_dashboard(auto_refresh=True, use_ohlc=True)
+                print("Background: OHLC cache ready.")
+            except Exception as e:
+                print(f"Background OHLC warm failed: {e}")
+
+        threading.Thread(target=_warm, daemon=True).start()
+
     if open_browser and host in ("127.0.0.1", "localhost"):
         webbrowser.open(url)
     try:

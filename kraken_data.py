@@ -137,6 +137,17 @@ def load_or_refresh(refresh: bool = False) -> tuple[dict[str, list[Candle]], lis
         ohlc, _ = load_cache()
         print(f"  {len(ohlc)} series")
         return ohlc, pairs
+    # On Fly/cloud dashboard cold start: never download full universe unless forced.
+    # Set KRAKEN_ALLOW_FULL_DOWNLOAD=1 (or refresh=True from run_daily --refresh).
+    import os
+
+    allow = os.environ.get("KRAKEN_ALLOW_FULL_DOWNLOAD", "").strip() in ("1", "true", "yes")
+    if not refresh and not allow:
+        print(
+            f"No OHLC cache at {CACHE_FILE} — skipping full download "
+            "(set KRAKEN_ALLOW_FULL_DOWNLOAD=1 or run run_daily.py --refresh)."
+        )
+        return {}, pairs
     print("Downloading full OHLC universe from Kraken...")
     ohlc = download_universe(pairs)
     save_cache(ohlc, meta)
