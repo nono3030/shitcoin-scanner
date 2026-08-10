@@ -1,4 +1,4 @@
-"""Shared config — Profil A risk 5% (full auto target)."""
+"""Shared config — Profil A risk 5% LIVE Bybit (FADE-BLOWOFF-T3)."""
 
 from __future__ import annotations
 
@@ -9,10 +9,13 @@ ROOT = Path(__file__).resolve().parent
 OUT_DIR = ROOT / "out"
 CACHE_DIR = ROOT / "cache"
 PAPER_DIR = ROOT / "paper"
+LIVE_DIR = ROOT / "live"
 CACHE_FILE = CACHE_DIR / "ohlc_daily.json"
 SIGNALS_FILE = OUT_DIR / "fade_signals_latest.json"
 PAPER_LEDGER = PAPER_DIR / "ledger.jsonl"
 PAPER_STATE = PAPER_DIR / "open_positions.json"
+LIVE_LEDGER = LIVE_DIR / "ledger.jsonl"
+LIVE_STATE = LIVE_DIR / "open_positions.json"
 BOT_LOG = OUT_DIR / "bot_run.log"
 
 # --- FADE-BLOWOFF-T3 ---
@@ -27,32 +30,43 @@ FEE_RT = 0.0052
 STRICT_VOL5 = False
 
 # =============================================================================
-# PROFIL A — risk 5%
-#   CROSS · 2x · marge 5%/trade · max 3 pos
-#   notional = 10% equity / trade · gross max 30%
-#   Backtest ~23m: CAGR ~+124% | MDD ~-67% | Y2025 ~+75% | no wipe (sample)
+# PROFIL A LIVE — risk 5% · 2x · max 4 · equity $50 · Bybit linear USDT
+#   notional = 10% equity / trade · gross max 40%
+#   Scan: Kraken USD alts · Exec: Bybit perps (AI sub-account)
 # =============================================================================
-PROFILE_NAME = "A_RISK5_L2_MAX3"
+PROFILE_NAME = "A_RISK5_L2_MAX4_LIVE"
 
-EQUITY_USD = 100.0
+EQUITY_USD = 50.0
 RISK_PCT_PER_TRADE = 0.05  # 5% margin per trade
 MARGIN_MODE = "cross"
 LEVERAGE = 2
-MAX_OPEN_POSITIONS = 3
+MAX_OPEN_POSITIONS = 4
+COMPOUNDING = True
 FULL_AUTO = True
 
-# Execution mode: "paper" | "live"  (live = needs exchange keys later)
-EXECUTION_MODE = "paper"
+# Execution mode: "paper" | "live"
+EXECUTION_MODE = "live"
 
 # Kill-switches
 MAX_DAILY_LOSS_PCT = 0.20
 MAX_DRAWDOWN_PCT = 0.70  # profile MDD ~67%, leave a bit of room
-MIN_EQUITY_USD = 25.0
+MIN_EQUITY_USD = 15.0
 
 # Paper / dashboard aliases
 PAPER_EQUITY_USD = EQUITY_USD
 ASSUMED_ADVERSE_MOVE = 1.0 / LEVERAGE
 MAX_NOTIONAL_PCT = RISK_PCT_PER_TRADE * LEVERAGE  # 10%
+
+# --- Bybit (live venue) ---
+BYBIT_ENV = "mainnet"  # "mainnet" | "testnet"
+BYBIT_CATEGORY = "linear"  # USDT perpetual
+BYBIT_ACCOUNT_TYPE = "UNIFIED"  # UTA
+BYBIT_SETTLE_COIN = "USDT"
+BYBIT_RECV_WINDOW = "5000"
+BYBIT_BASE_URLS = {
+    "mainnet": "https://api.bybit.com",
+    "testnet": "https://api-testnet.bybit.com",
+}
 
 # Daily job
 # Prefer running shortly after UTC daily candle close (~00:05–00:30 UTC)
@@ -61,8 +75,7 @@ REFRESH_OHLC_ON_RUN = True  # full refresh is slow; set False to use cache+targe
 HTTP_SLEEP = 0.35
 KRAKEN_PUBLIC = "https://api.kraken.com/0/public"
 
-# Live API (env only — never hardcode secrets)
-# FADE_API_KEY / FADE_API_SECRET / FADE_EXCHANGE
+# Live API keys: BYBIT_API_KEY / BYBIT_API_SECRET (env or live/.env — never hardcode)
 
 
 @dataclass(frozen=True)
@@ -111,5 +124,5 @@ def profile_summary() -> str:
         f"{PROFILE_NAME} | equity=${eq:.0f} | {MARGIN_MODE} {LEVERAGE}x | "
         f"risk {RISK_PCT_PER_TRADE*100:.0f}% (margin ${margin_usd(eq):.2f}, "
         f"notional ${position_notional(eq):.2f}) | max_pos={MAX_OPEN_POSITIONS} | "
-        f"mode={EXECUTION_MODE} auto={FULL_AUTO}"
+        f"mode={EXECUTION_MODE} auto={FULL_AUTO} compound={COMPOUNDING}"
     )
