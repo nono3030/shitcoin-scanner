@@ -2,8 +2,10 @@
 """
 Dashboard perfs + charts style TradingView (Lightweight Charts).
 
+Live mode: state local (live/) merged with Bybit exchange (source de vérité).
+
   python dashboard.py              # génère + ouvre
-  python dashboard.py --serve      # http://127.0.0.1:8765  (recommandé pour charts)
+  python dashboard.py --serve      # http://127.0.0.1:8765  (recommandé — refresh live)
   python dashboard.py --no-open
 """
 
@@ -17,16 +19,25 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 from config import (
+    BYBIT_ENV,
+    COMPOUNDING,
+    EQUITY_USD,
+    EXECUTION_MODE,
     FEE_RT,
+    LIVE_STATE,
+    MAX_OPEN_POSITIONS,
+    MIN_EQUITY_USD,
     OUT_DIR,
     PAPER_EQUITY_USD,
     PAPER_STATE,
+    PROFILE_NAME,
     SIGNALS_FILE,
     active_rule,
     position_notional,
+    profile_summary,
 )
 from kraken_data import Candle, load_or_refresh
 
@@ -54,6 +65,92 @@ def _short_pnl(entry: float, last: float) -> float:
     return (entry - last) / entry
 
 
+def _is_live() -> bool:
+    return (EXECUTION_MODE or "").strip().lower() == "live"
+
+
+def _symbol_to_pair(symbol: str) -> str:
+    s = (symbol or "").upper()
+    if s.endswith("USDT"):
+        return f"{s[:-4]}/USD"
+    if s.endswith("USD"):
+        return f"{s[:-3]}/USD"
+    return s
+
+
+def fetch_bybit_snapshot() -> dict[str, Any]:
+    """Live snapshot from Bybit API (AI sub-account of the API keys)."""
+    snap: dict[str, Any] = {
+        "ok": False,
+        "error": None,
+        "equity_usdt": None,
+        "positions": [],
+        "orders": [],
+        "api_note": None,
+        "api_uid": None,
+        "env": BYBIT_ENV,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        from broker_bybit import default_broker
+
+        br = default_broker()
+        snap["env"] = br.env
+        snap["equity_usdt"] = float(br.get_equity_usdt())
+        raw_pos = br.list_open_positions()
+        # strip heavy raw
+        snap["positions"] = [
+            {
+                "symbol": p.get("symbol"),
+                "side": p.get("side"),
+                "size": p.get("size"),
+                "avgPrice": p.get("avgPrice"),
+                "markPrice": p.get("markPrice"),
+                "unrealisedPnl": p.get("unrealisedPnl"),
+                "leverage": p.get("leverage"),
+            }
+            for p in raw_pos
+        ]
+        try:
+            oh = br.private_get(
+                "/v5/order/history",
+                {"category": "linear", "settleCoin": "USDT", "limit": "20"},
+            )
+            rows = (oh.get("result") or {}).get("list") or []
+            snap["orders"] = [
+                {
+                    "orderId": o.get("orderId"),
+                    "symbol": o.get("symbol"),
+                    "side": o.get("side"),
+                    "orderType": o.get("orderType"),
+                    "qty": o.get("qty"),
+                    "avgPrice": o.get("avgPrice"),
+                    "orderStatus": o.get("orderStatus"),
+                    "createdTime": o.get("createdTime"),
+                    "updatedTime": o.get("updatedTime"),
+                    "reduceOnly": o.get("reduceOnly"),
+                }
+                for o in rows
+            ]
+        except Exception as e:
+            snap["orders_error"] = str(e)
+
+        try:
+            meta = br.private_get("/v5/user/query-api")
+            res = meta.get("result") or {}
+            snap["api_note"] = res.get("note")
+            snap["api_uid"] = res.get("userID") or res.get("uid")
+            snap["api_is_master"] = res.get("isMaster")
+            snap["api_parent_uid"] = res.get("parentUid")
+        except Exception:
+            pass
+
+        snap["ok"] = True
+    except Exception as e:
+        snap["error"] = str(e)
+    return snap
+
+
 def enrich_positions(state: dict, ohlc: dict | None) -> list[dict]:
     rows = []
     for p in state.get("positions") or []:
@@ -63,6 +160,8 @@ def enrich_positions(state: dict, ohlc: dict | None) -> list[dict]:
         r["last_px"] = None
         r["last_date"] = None
         r["progress"] = None
+        r["exchange_synced"] = None
+        r["pnl_source"] = "local"
 
         if r.get("status") == "open" and ohlc and r.get("pair") in ohlc and r.get("entry_px"):
             series = ohlc[r["pair"]]
@@ -73,15 +172,17 @@ def enrich_positions(state: dict, ohlc: dict | None) -> list[dict]:
                 r["last_px"] = last.c
                 r["last_date"] = last.date
                 r["bars_held"] = len(bars)
-                gross = _short_pnl(r["entry_px"], last.c)
+                gross = _short_pnl(float(r["entry_px"]), last.c)
                 net = gross - FEE_RT / 2
                 r["u_pnl_pct"] = net
                 r["u_pnl_usd"] = net * float(r.get("notional_usd") or 0)
+                r["pnl_source"] = "kraken_ohlc"
         elif r.get("status") == "closed":
             r["u_pnl_pct"] = r.get("realized_pnl_pct")
             r["u_pnl_usd"] = r.get("realized_pnl_usd")
             r["last_px"] = r.get("exit_px")
             r["last_date"] = r.get("exit_date")
+            r["pnl_source"] = "closed"
 
         hd = max(1, int(r.get("hold_days") or 3))
         bh = int(r.get("bars_held") or 0)
@@ -90,14 +191,142 @@ def enrich_positions(state: dict, ohlc: dict | None) -> list[dict]:
     return rows
 
 
-def stats_from_positions(positions: list[dict], cash_pnl: float, equity_start: float) -> dict:
+def merge_exchange_into_positions(
+    positions: list[dict],
+    exchange_positions: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Overlay Bybit mark/avg/uPnL onto open book rows.
+    Returns (merged_positions, orphan_exchange_rows).
+    Exchange uPnL is source of truth for open trades when matched.
+    """
+    by_sym = {(p.get("symbol") or "").upper(): p for p in exchange_positions if p.get("symbol")}
+    used: set[str] = set()
+    out: list[dict] = []
+
+    for r in positions:
+        row = dict(r)
+        sym = (row.get("bybit_symbol") or "").upper()
+        if not sym and row.get("pair"):
+            # best-effort map
+            pair = row["pair"].upper().replace(" ", "")
+            if "/" in pair:
+                sym = pair.split("/")[0] + "USDT"
+            row["bybit_symbol"] = sym
+
+        if row.get("status") == "open" and sym and sym in by_sym:
+            ep = by_sym[sym]
+            used.add(sym)
+            row["exchange_synced"] = True
+            row["sync_status"] = "matched"
+            row["exchange_size"] = ep.get("size")
+            row["exchange_side"] = ep.get("side")
+            row["exchange_avg"] = ep.get("avgPrice")
+            row["exchange_mark"] = ep.get("markPrice")
+            row["exchange_upnl"] = ep.get("unrealisedPnl")
+            row["exchange_leverage"] = ep.get("leverage")
+            if ep.get("markPrice"):
+                row["last_px"] = ep["markPrice"]
+            if ep.get("avgPrice") and not row.get("entry_px"):
+                row["entry_px"] = ep["avgPrice"]
+            # Prefer exchange entry avg for display consistency with Bybit app
+            if ep.get("avgPrice"):
+                row["entry_px_display"] = ep["avgPrice"]
+            else:
+                row["entry_px_display"] = row.get("entry_px")
+            upnl = float(ep.get("unrealisedPnl") or 0)
+            row["u_pnl_usd"] = upnl
+            notion = float(row.get("notional_usd") or 0)
+            if notion > 0:
+                row["u_pnl_pct"] = upnl / notion
+            elif row.get("entry_px") and ep.get("markPrice"):
+                row["u_pnl_pct"] = _short_pnl(float(row["entry_px"]), float(ep["markPrice"]))
+            row["pnl_source"] = "bybit_exchange"
+        elif row.get("status") == "open":
+            row["exchange_synced"] = False
+            row["sync_status"] = "local_only"
+            row["entry_px_display"] = row.get("entry_px")
+            row["sync_warning"] = "open_in_book_not_on_exchange"
+        else:
+            row["entry_px_display"] = row.get("entry_px")
+            if row.get("status") == "closed":
+                row["sync_status"] = "closed"
+
+        out.append(row)
+
+    orphans: list[dict] = []
+    for sym, ep in by_sym.items():
+        if sym in used:
+            continue
+        pair = _symbol_to_pair(sym)
+        size = float(ep.get("size") or 0)
+        avg = float(ep.get("avgPrice") or 0) or None
+        mark = float(ep.get("markPrice") or 0) or None
+        upnl = float(ep.get("unrealisedPnl") or 0)
+        notion = (size * (avg or mark or 0)) if size else None
+        orphans.append(
+            {
+                "id": f"ex-{sym}",
+                "pair": pair,
+                "bybit_symbol": sym,
+                "status": "open",
+                "side": "short" if (ep.get("side") or "").lower() == "sell" else "long",
+                "entry_px": avg,
+                "entry_px_display": avg,
+                "last_px": mark,
+                "qty": size,
+                "exchange_size": size,
+                "exchange_side": ep.get("side"),
+                "exchange_avg": avg,
+                "exchange_mark": mark,
+                "exchange_upnl": upnl,
+                "exchange_leverage": ep.get("leverage"),
+                "notional_usd": notion,
+                "u_pnl_usd": upnl,
+                "u_pnl_pct": (upnl / notion) if notion else None,
+                "hold_days": None,
+                "bars_held": None,
+                "progress": None,
+                "exchange_synced": True,
+                "sync_status": "exchange_only",
+                "sync_warning": "on_exchange_not_in_live_book",
+                "pnl_source": "bybit_exchange",
+            }
+        )
+        out.append(orphans[-1])
+
+    return out, orphans
+
+
+def stats_from_positions(
+    positions: list[dict],
+    cash_pnl: float,
+    equity_start: float,
+    *,
+    live_equity: float | None = None,
+    exchange_upnl: float | None = None,
+) -> dict:
     open_p = [p for p in positions if p.get("status") == "open"]
     closed = [p for p in positions if p.get("status") == "closed"]
     pending = [p for p in positions if p.get("status") == "pending"]
 
-    u_pnl = sum(p.get("u_pnl_usd") or 0 for p in open_p)
+    u_pnl = (
+        float(exchange_upnl)
+        if exchange_upnl is not None
+        else sum(float(p.get("u_pnl_usd") or 0) for p in open_p)
+    )
     realized = cash_pnl
-    equity = equity_start + realized + u_pnl
+    if live_equity is not None:
+        equity = float(live_equity)
+        total_pnl = equity - equity_start
+        # implied realized ≈ equity - start - uPnL (fees/funding included in equity)
+        implied_realized = equity - equity_start - u_pnl
+        realized_display = implied_realized
+    else:
+        equity = equity_start + realized + u_pnl
+        total_pnl = realized + u_pnl
+        realized_display = realized
+
     closed_pnls = [p.get("realized_pnl_usd") or 0 for p in closed]
     wins = [x for x in closed_pnls if x > 0]
     losses = [x for x in closed_pnls if x <= 0]
@@ -115,14 +344,22 @@ def stats_from_positions(positions: list[dict], cash_pnl: float, equity_start: f
                 "pair": p.get("pair"),
                 "pnl": p.get("realized_pnl_usd") or 0,
             })
+    if live_equity is not None:
+        if not curve:
+            curve = [{"t": "start", "eq": equity_start}]
+        curve.append({"t": "now", "eq": live_equity, "pair": "BYBIT", "pnl": 0})
+
+    eq_for_size = live_equity if (live_equity and COMPOUNDING) else equity_start
 
     return {
         "equity_start": equity_start,
         "equity_now": equity,
-        "realized_pnl": realized,
+        "live_equity": live_equity,
+        "realized_pnl": realized_display,
+        "book_cash_pnl": cash_pnl,
         "unrealized_pnl": u_pnl,
-        "total_pnl": realized + u_pnl,
-        "total_pnl_pct": (realized + u_pnl) / equity_start if equity_start else 0,
+        "total_pnl": total_pnl,
+        "total_pnl_pct": total_pnl / equity_start if equity_start else 0,
         "n_open": len(open_p),
         "n_closed": len(closed),
         "n_pending": len(pending),
@@ -133,7 +370,9 @@ def stats_from_positions(positions: list[dict], cash_pnl: float, equity_start: f
         "worst_trade": min(closed_pnls) if closed_pnls else None,
         "sum_closed": sum(closed_pnls) if closed_pnls else 0.0,
         "curve": curve,
-        "notional_per_trade": position_notional(equity_start),
+        "notional_per_trade": position_notional(eq_for_size or equity_start),
+        "max_open": MAX_OPEN_POSITIONS,
+        "min_equity": MIN_EQUITY_USD,
     }
 
 
@@ -317,11 +556,31 @@ def build_chart_bundle(
 
 
 def build_payload(use_ohlc: bool = True) -> dict:
-    state = _load_json(PAPER_STATE, {
-        "equity_start": PAPER_EQUITY_USD,
-        "cash_pnl": 0.0,
-        "positions": [],
-    })
+    live = _is_live()
+    if live:
+        state = _load_json(
+            LIVE_STATE,
+            {
+                "equity_start": EQUITY_USD,
+                "cash_pnl": 0.0,
+                "positions": [],
+                "killed": False,
+            },
+        )
+        book_label = "live"
+        state_path = str(LIVE_STATE)
+    else:
+        state = _load_json(
+            PAPER_STATE,
+            {
+                "equity_start": PAPER_EQUITY_USD,
+                "cash_pnl": 0.0,
+                "positions": [],
+            },
+        )
+        book_label = "paper"
+        state_path = str(PAPER_STATE)
+
     ohlc = None
     if use_ohlc:
         try:
@@ -329,26 +588,98 @@ def build_payload(use_ohlc: bool = True) -> dict:
         except Exception as e:
             print(f"warn: OHLC load failed ({e})")
 
-    positions = enrich_positions(state, ohlc)
+    positions = enrich_positions(state or {}, ohlc)
+
+    exchange: dict[str, Any] = {
+        "ok": False,
+        "skipped": True,
+        "error": None,
+        "equity_usdt": None,
+        "positions": [],
+        "orders": [],
+    }
+    orphans: list[dict] = []
+    if live:
+        exchange = fetch_bybit_snapshot()
+        exchange["skipped"] = False
+        if exchange.get("ok"):
+            positions, orphans = merge_exchange_into_positions(
+                positions, exchange.get("positions") or []
+            )
+            print(
+                f"  bybit ok equity=${exchange.get('equity_usdt'):.4f} "
+                f"ex_pos={len(exchange.get('positions') or [])} "
+                f"orders={len(exchange.get('orders') or [])}"
+            )
+        else:
+            print(f"  bybit ERROR: {exchange.get('error')}")
+
+    ex_upnl = None
+    live_eq = None
+    if live and exchange.get("ok"):
+        live_eq = float(exchange.get("equity_usdt") or 0)
+        ex_upnl = sum(float(p.get("unrealisedPnl") or 0) for p in (exchange.get("positions") or []))
+
+    equity_start = float((state or {}).get("equity_start") or (EQUITY_USD if live else PAPER_EQUITY_USD))
     stats = stats_from_positions(
         positions,
-        cash_pnl=float(state.get("cash_pnl") or 0),
-        equity_start=float(state.get("equity_start") or PAPER_EQUITY_USD),
+        cash_pnl=float((state or {}).get("cash_pnl") or 0),
+        equity_start=equity_start,
+        live_equity=live_eq,
+        exchange_upnl=ex_upnl,
     )
+
+    # sync health
+    open_rows = [p for p in positions if p.get("status") == "open"]
+    n_matched = sum(1 for p in open_rows if p.get("sync_status") == "matched")
+    n_local_only = sum(1 for p in open_rows if p.get("sync_status") == "local_only")
+    n_ex_only = sum(1 for p in open_rows if p.get("sync_status") == "exchange_only")
+    stats["n_matched"] = n_matched
+    stats["n_local_only"] = n_local_only
+    stats["n_exchange_only"] = n_ex_only
+    stats["sync_ok"] = bool(
+        (not live)
+        or (exchange.get("ok") and n_local_only == 0 and n_ex_only == 0)
+    )
+
     signals_file = _load_json(SIGNALS_FILE, {}) or {}
     signals = signals_file.get("signals") or []
     charts = build_chart_bundle(ohlc, positions, signals)
     bt = load_backtest_highlights()
 
-    # default pair: first open, else first chart key
-    open_pairs = [p["pair"] for p in positions if p.get("status") == "open" and p.get("pair") in charts]
+    open_pairs = [
+        p["pair"] for p in positions if p.get("status") == "open" and p.get("pair") in charts
+    ]
     default_pair = open_pairs[0] if open_pairs else (next(iter(charts), None))
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "live" if live else "paper",
+        "book": book_label,
+        "state_path": state_path,
+        "profile": profile_summary(),
+        "profile_name": PROFILE_NAME,
         "rule": active_rule().describe(),
+        "killed": bool((state or {}).get("killed")),
+        "kill_reason": (state or {}).get("kill_reason"),
         "stats": stats,
         "positions": positions,
+        "exchange": {
+            "ok": exchange.get("ok"),
+            "error": exchange.get("error"),
+            "equity_usdt": exchange.get("equity_usdt"),
+            "env": exchange.get("env"),
+            "api_note": exchange.get("api_note"),
+            "api_uid": exchange.get("api_uid"),
+            "api_is_master": exchange.get("api_is_master"),
+            "api_parent_uid": exchange.get("api_parent_uid"),
+            "fetched_at": exchange.get("fetched_at"),
+            "positions": exchange.get("positions") or [],
+            "orders": exchange.get("orders") or [],
+            "n_positions": len(exchange.get("positions") or []),
+            "n_orders": len(exchange.get("orders") or []),
+            "orphans": orphans,
+        },
         "signals": signals,
         "near_misses": (signals_file.get("near_misses") or [])[:10],
         "signals_generated_at": signals_file.get("generated_at"),
@@ -395,10 +726,26 @@ def _px(x: float | None) -> str:
     return f"{x:.6g}"
 
 
+def _ms_utc(ms: str | int | None) -> str:
+    if not ms:
+        return "—"
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
+    except Exception:
+        return str(ms)
+
+
 def render_html(data: dict, auto_refresh: bool = False) -> str:
     s = data["stats"]
     bt = data.get("backtest")
-    refresh_meta = '<meta http-equiv="refresh" content="60">' if auto_refresh else ""
+    ex = data.get("exchange") or {}
+    mode = data.get("mode") or "paper"
+    live = mode == "live"
+    # auto-refresh more often in live serve mode
+    refresh_meta = (
+        '<meta http-equiv="refresh" content="30">' if auto_refresh and live
+        else ('<meta http-equiv="refresh" content="60">' if auto_refresh else "")
+    )
     gen = data["generated_at"].replace("T", " ")[:19] + " UTC"
     # Embed chart JSON safely
     charts_json = json.dumps(data.get("charts") or {}, separators=(",", ":"))
@@ -433,8 +780,9 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
 
     def pos_rows(status: str) -> str:
         xs = [p for p in data["positions"] if p.get("status") == status]
+        cols = 12 if live else 10
         if not xs:
-            return f'<tr><td colspan="10" class="muted">Aucune position {status}</td></tr>'
+            return f'<tr><td colspan="{cols}" class="muted">Aucune position {status}</td></tr>'
         if status == "open":
             xs = sorted(xs, key=lambda p: p.get("u_pnl_usd") or 0, reverse=True)
         else:
@@ -443,18 +791,41 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
         for p in xs:
             pnl = p.get("u_pnl_usd") if status != "closed" else p.get("realized_pnl_usd")
             pnl_pct = p.get("u_pnl_pct") if status != "closed" else p.get("realized_pnl_pct")
-            prog = int((p.get("progress") or 0) * 100)
+            prog = int((p.get("progress") or 0) * 100) if p.get("progress") is not None else 0
             pair = p.get("pair") or ""
+            sym = p.get("bybit_symbol") or "—"
+            sync = p.get("sync_status") or ("—" if not live else "?")
+            sync_cls = {
+                "matched": "pos",
+                "local_only": "neg",
+                "exchange_only": "neg",
+                "closed": "muted",
+            }.get(sync, "muted")
+            entry_show = p.get("entry_px_display") if status == "open" else p.get("entry_px")
+            size_show = p.get("exchange_size") if p.get("exchange_size") is not None else p.get("qty")
+            src = p.get("pnl_source") or ""
+            hold = (
+                f'{p.get("bars_held") or 0}/{p.get("hold_days") or 3}j'
+                if p.get("hold_days") is not None
+                else "—"
+            )
+            extra = ""
+            if live:
+                extra = f'''
+              <td class="mono tiny">{sym}</td>
+              <td class="mono tiny">{size_show if size_show is not None else "—"}</td>
+              <td class="mono tiny {sync_cls}">{sync}</td>'''
             html.append(f'''
-            <tr class="trade-row" data-pair="{pair}" onclick="window.focusPair('{pair}')" title="Voir le chart">
+            <tr class="trade-row" data-pair="{pair}" onclick="window.focusPair('{pair}')" title="Voir le chart · PnL source={src}">
               <td><span class="tag {status}">{status}</span></td>
               <td class="pair">{pair}</td>
+              {extra}
               <td class="mono">{p.get("entry_date") or "—"}</td>
-              <td class="mono">{_px(p.get("entry_px"))}</td>
+              <td class="mono">{_px(entry_show)}</td>
               <td class="mono">{_px(p.get("last_px"))}</td>
               <td>
                 <div class="bar"><div style="width:{prog}%"></div></div>
-                <span class="muted tiny">{p.get("bars_held") or 0}/{p.get("hold_days") or 3}j</span>
+                <span class="muted tiny">{hold}</span>
               </td>
               <td class="mono">{_usd_plain(p.get("notional_usd"))}</td>
               <td class="mono {_cls(pnl_pct)}">{_pct(pnl_pct)}</td>
@@ -462,6 +833,39 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
               <td><button type="button" class="btn-chart" onclick="event.stopPropagation();window.focusPair('{pair}')">Chart</button></td>
             </tr>''')
         return "\n".join(html)
+
+    # Bybit raw positions + orders tables
+    ex_pos_rows = []
+    for p in ex.get("positions") or []:
+        upnl = p.get("unrealisedPnl")
+        ex_pos_rows.append(f'''
+        <tr>
+          <td class="pair mono">{p.get("symbol")}</td>
+          <td class="mono">{p.get("side")}</td>
+          <td class="mono">{p.get("size")}</td>
+          <td class="mono">{_px(p.get("avgPrice"))}</td>
+          <td class="mono">{_px(p.get("markPrice"))}</td>
+          <td class="mono {_cls(upnl)}">{_usd_plain(upnl)}</td>
+          <td class="mono">{p.get("leverage") or "—"}x</td>
+        </tr>''')
+    if not ex_pos_rows:
+        ex_pos_rows = ['<tr><td colspan="7" class="muted">Aucune position exchange</td></tr>']
+
+    ex_ord_rows = []
+    for o in (ex.get("orders") or [])[:15]:
+        ex_ord_rows.append(f'''
+        <tr>
+          <td class="mono tiny">{_ms_utc(o.get("createdTime"))}</td>
+          <td class="pair mono">{o.get("symbol")}</td>
+          <td class="mono">{o.get("side")}</td>
+          <td class="mono">{o.get("orderType")}</td>
+          <td class="mono">{o.get("qty")}</td>
+          <td class="mono">{_px(float(o["avgPrice"]) if o.get("avgPrice") not in (None,"") else None)}</td>
+          <td><span class="tag open">{o.get("orderStatus")}</span></td>
+          <td class="mono tiny">{(o.get("orderId") or "")[:8]}…</td>
+        </tr>''')
+    if not ex_ord_rows:
+        ex_ord_rows = ['<tr><td colspan="8" class="muted">Aucun ordre récent</td></tr>']
 
     sig_rows = []
     for i, sig in enumerate(data.get("signals") or [], 1):
@@ -600,23 +1004,56 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
   }}
   .chip:hover, .chip.on {{ border-color:var(--accent); color:var(--accent); }}
   .hint {{ color:var(--muted); font-size:0.78rem; margin-top:6px; }}
+  .mode-live {{ background:rgba(61,214,140,0.12); border-color:rgba(61,214,140,0.45); color:var(--pos); }}
+  .mode-paper {{ background:rgba(240,180,41,0.12); border-color:rgba(240,180,41,0.45); color:var(--warn); }}
+  .mode-err {{ background:rgba(240,113,120,0.12); border-color:rgba(240,113,120,0.45); color:var(--neg); }}
+  .banner {{
+    margin-bottom:12px; padding:10px 14px; border-radius:10px; border:1px solid var(--border);
+    font-size:0.86rem; line-height:1.45;
+  }}
+  .banner.ok {{ background:rgba(61,214,140,0.08); border-color:rgba(61,214,140,0.35); }}
+  .banner.warn {{ background:rgba(240,180,41,0.08); border-color:rgba(240,180,41,0.4); }}
+  .banner.err {{ background:rgba(240,113,120,0.08); border-color:rgba(240,113,120,0.4); }}
+  .tag.matched {{ background:rgba(61,214,140,0.15); color:var(--pos); }}
+  .tag.filled {{ background:rgba(61,214,140,0.15); color:var(--pos); }}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <div>
-      <h1>Fade Dashboard</h1>
-      <div class="sub">{data["rule"]}</div>
+      <h1>Fade Dashboard {'· LIVE Bybit' if live else '· Paper'}</h1>
+      <div class="sub">{data.get("profile") or data["rule"]}</div>
+      <div class="sub" style="margin-top:2px">{data["rule"]}</div>
     </div>
-    <div class="badge"><span class="dot"></span> Maj {gen}</div>
+    <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+      <div class="badge {'mode-live' if live else 'mode-paper'}">{'LIVE' if live else 'PAPER'}</div>
+      <div class="badge {'mode-live' if ex.get('ok') else ('mode-err' if live else '')}">
+        <span class="dot" style="{'background:var(--pos)' if (ex.get('ok') or not live) else 'background:var(--neg)'}"></span>
+        {'Bybit OK' if ex.get('ok') else ('Bybit OFF' if live else 'local')}
+      </div>
+      <div class="badge"><span class="dot"></span> Maj {gen}</div>
+    </div>
   </header>
+
+  {'' if not live else (f'''
+  <div class="banner {'ok' if ex.get('ok') and s.get('sync_ok') else ('err' if not ex.get('ok') else 'warn')}">
+    <strong>Source de vérité :</strong> equity + uPnL + positions/ordres = API Bybit
+    (sub <code>{ex.get('api_note') or 'AI'}</code>
+    uid=<code>{ex.get('api_uid') or '?'}</code> · env=<code>{ex.get('env')}</code>).
+    Book local = hold days / signaux.
+    Sync open: <strong class="{'pos' if s.get('sync_ok') else 'neg'}">{s.get('n_matched',0)} matched</strong>
+    · {s.get('n_local_only',0)} local-only · {s.get('n_exchange_only',0)} exchange-only.
+    {(' <strong class="neg">API: ' + str(ex.get('error')) + '</strong>') if ex.get('error') else ''}
+    {(' <strong class="neg">KILL: ' + str(data.get('kill_reason')) + '</strong>') if data.get('killed') else ''}
+  </div>
+  ''')}
 
   <div class="grid">
     <div class="card span-3">
-      <div class="label">Equity paper</div>
+      <div class="label">{'Equity Bybit (live)' if live else 'Equity paper'}</div>
       <div class="big">{_usd_plain(s["equity_now"]).lstrip("+")}</div>
-      <div class="muted tiny">start {_usd_plain(s["equity_start"]).lstrip("+")}</div>
+      <div class="muted tiny">start {_usd_plain(s["equity_start"]).lstrip("+")}{' · UTA sub-account' if live else ''}</div>
     </div>
     <div class="card span-3">
       <div class="label">P&amp;L total</div>
@@ -626,12 +1063,12 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
     <div class="card span-3">
       <div class="label">Positions</div>
       <div class="big">{s["n_open"]}<span class="muted" style="font-size:1rem"> open</span></div>
-      <div class="muted tiny">{s["n_pending"]} pending · {s["n_closed"]} closed</div>
+      <div class="muted tiny">{'ex ' + str(ex.get('n_positions') or 0) + ' · ' if live else ''}{s.get("n_pending", 0)} pending · {s["n_closed"]} closed · max {s.get("max_open", "—")}</div>
     </div>
     <div class="card span-3">
-      <div class="label">Win rate (closed)</div>
-      <div class="big">{_pct(s["win_rate"],0) if s["win_rate"] is not None else "—"}</div>
-      <div class="muted tiny">best {_usd_plain(s["best_trade"])} · worst {_usd_plain(s["worst_trade"])}</div>
+      <div class="label">{'Sync book ↔ Bybit' if live else 'Win rate (closed)'}</div>
+      <div class="big {'pos' if (not live or s.get('sync_ok')) else 'neg'}">{'OK' if (not live or s.get('sync_ok')) else 'DRIFT' if live else (_pct(s['win_rate'],0) if s.get('win_rate') is not None else '—')}</div>
+      <div class="muted tiny">{'matched ' + str(s.get('n_matched',0)) + '/' + str(s.get('n_open',0)) if live else ('best ' + _usd_plain(s.get('best_trade')) + ' · worst ' + _usd_plain(s.get('worst_trade')))}</div>
     </div>
 
     <!-- CHART -->
@@ -671,21 +1108,53 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
     </div>
 
     <div class="card span-12">
-      <h2>Positions ouvertes <span class="count">{s["n_open"]}</span></h2>
+      <h2>Positions ouvertes (book + Bybit) <span class="count">{s["n_open"]}</span></h2>
+      <div class="muted tiny" style="margin-bottom:8px">
+        Open: uPnL = Bybit quand matched. Hold = daily bars Kraken. Sync matched = fiable 1:1 avec l'exchange.
+      </div>
       <table>
         <thead><tr>
-          <th>Statut</th><th>Pair</th><th>Entry</th><th>Px in</th><th>Last</th>
+          <th>Statut</th><th>Pair</th>
+          {('<th>Bybit</th><th>Size</th><th>Sync</th>' if live else '')}
+          <th>Entry</th><th>Px in</th><th>Mark/Last</th>
           <th>Hold</th><th>Notional</th><th>P&amp;L %</th><th>P&amp;L $</th><th></th>
         </tr></thead>
         <tbody>{pos_rows("open")}</tbody>
       </table>
     </div>
 
+    {'' if not live else f'''
     <div class="card span-12">
-      <h2>Historique fermé <span class="count">{s["n_closed"]}</span></h2>
+      <h2>Bybit raw positions <span class="count">{ex.get("n_positions") or 0}</span></h2>
+      <div class="muted tiny" style="margin-bottom:8px">
+        Snapshot API direct · uid={ex.get("api_uid") or "?"} · fetch {ex.get("fetched_at") or "—"}
+      </div>
       <table>
         <thead><tr>
-          <th>Statut</th><th>Pair</th><th>Entry</th><th>Px in</th><th>Exit</th>
+          <th>Symbol</th><th>Side</th><th>Size</th><th>Avg</th><th>Mark</th><th>uPnL $</th><th>Lev</th>
+        </tr></thead>
+        <tbody>{''.join(ex_pos_rows)}</tbody>
+      </table>
+    </div>
+
+    <div class="card span-12">
+      <h2>Bybit order history <span class="count">{ex.get("n_orders") or 0}</span></h2>
+      <table>
+        <thead><tr>
+          <th>UTC</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Avg</th><th>Status</th><th>OrderId</th>
+        </tr></thead>
+        <tbody>{''.join(ex_ord_rows)}</tbody>
+      </table>
+    </div>
+    '''}
+
+    <div class="card span-12">
+      <h2>Historique fermé (book) <span class="count">{s["n_closed"]}</span></h2>
+      <table>
+        <thead><tr>
+          <th>Statut</th><th>Pair</th>
+          {('<th>Bybit</th><th>Size</th><th>Sync</th>' if live else '')}
+          <th>Entry</th><th>Px in</th><th>Exit</th>
           <th>Hold</th><th>Notional</th><th>P&amp;L %</th><th>P&amp;L $</th><th></th>
         </tr></thead>
         <tbody>{pos_rows("closed")}</tbody>
@@ -706,9 +1175,10 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
   </div>
 
   <footer>
-    <span>Serveur live (idéal charts): <code>python dashboard.py --serve</code></span>
-    <span>Scan: <code>python scan_fade_signals.py</code></span>
-    <span>Paper: <code>python paper_book.py mark</code></span>
+    <span>Serveur (refresh Bybit): <code>python dashboard.py --serve</code></span>
+    <span>Status: <code>python live_book.py status</code></span>
+    <span>Ping: <code>python broker_bybit.py ping</code></span>
+    <span>Book: <code>{data.get("state_path") or "—"}</code></span>
   </footer>
 </div>
 
@@ -902,8 +1372,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if path == "/data.json":
-            data = build_payload(use_ohlc=True)
+        if path in ("/data.json", "/api/live", "/live.json"):
+            data = build_payload(use_ohlc=(path == "/data.json"))
             # without full candles for lightness
             slim = {k: v for k, v in data.items() if k != "charts"}
             body = json.dumps(slim, default=str).encode()
