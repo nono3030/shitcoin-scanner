@@ -1,23 +1,14 @@
-# Fly.io app config — shitcoin-scanner
-# IMPORTANT: do NOT use the empty "fly launch plan propose" wizard without
-# a local checkout. From the repo root (where Dockerfile lives):
+# Fly.io — dashboard + daily job (same machine, volume /data)
 #
-#   fly apps create shitcoin-scanner -o <your-org>
-#   fly volumes create scanner_data --region fra --size 1 -a shitcoin-scanner
-#   fly secrets set BYBIT_API_KEY=... BYBIT_API_SECRET=... -a shitcoin-scanner
-#   fly deploy -a shitcoin-scanner --dockerfile Dockerfile
+# Deploy:
+#   fly deploy -a shitcoin-scanner --dockerfile Dockerfile --remote-only --yes
 #
-# Cron later:
-#   fly machine run . -a shitcoin-scanner --region fra --schedule "15 0 * * *" \
-#     --env DATA_ROOT=/data --command "sh scripts/fly_daily.sh" \
-#     --volume scanner_data:/data --restart no
+# Daily trading: 00:15 UTC (after 00:00 UTC daily close), window 00–04 UTC in config.
 
 app = "shitcoin-scanner"
-# fra (Germany) is geo-blocked by Bybit CloudFront → use sin/nrt for API
 primary_region = "sin"
 
 [build]
-  # Explicit — required so Fly never "detects" empty source
   dockerfile = "Dockerfile"
   ignorefile = ".dockerignore"
 
@@ -27,13 +18,17 @@ primary_region = "sin"
   PORT = "8080"
   BYBIT_ENV = "mainnet"
   PYTHONUNBUFFERED = "1"
+  PYTHONPATH = "/app"
+  DAILY_RUN_UTC_HOUR = "0"
+  DAILY_RUN_UTC_MINUTE = "15"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  # MUST stay up for midnight scheduler — do not auto-stop
+  auto_stop_machines = "off"
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ["app"]
 
   [[http_service.checks]]
@@ -48,8 +43,6 @@ primary_region = "sin"
   cpu_kind = "shared"
   cpus = 1
 
-# Create once before first deploy (Bybit needs non-DE region, e.g. sin):
-#   fly volumes create scanner_data_sin --region sin --size 1 -a shitcoin-scanner
 [mounts]
   source = "scanner_data_sin"
   destination = "/data"
