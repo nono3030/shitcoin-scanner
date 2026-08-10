@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-OUT_DIR = ROOT / "out"
-CACHE_DIR = ROOT / "cache"
-PAPER_DIR = ROOT / "paper"
-LIVE_DIR = ROOT / "live"
+# On Fly/Railway: set DATA_ROOT=/data (persistent volume). Local: defaults to repo root.
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", str(ROOT))).resolve()
+OUT_DIR = DATA_ROOT / "out"
+CACHE_DIR = DATA_ROOT / "cache"
+PAPER_DIR = DATA_ROOT / "paper"
+LIVE_DIR = DATA_ROOT / "live"
 CACHE_FILE = CACHE_DIR / "ohlc_daily.json"
 SIGNALS_FILE = OUT_DIR / "fade_signals_latest.json"
 PAPER_LEDGER = PAPER_DIR / "ledger.jsonl"

@@ -42,7 +42,9 @@ from config import (
 from kraken_data import Candle, load_or_refresh
 
 DASH_HTML = OUT_DIR / "dashboard.html"
-PORT = 8765
+# Fly/Railway inject PORT; bind 0.0.0.0 in production so the proxy can reach us.
+PORT = int(__import__("os").environ.get("PORT", "8765"))
+BIND_HOST = __import__("os").environ.get("BIND_HOST", "127.0.0.1")
 CHART_BARS = 120  # daily bars shown on chart
 
 
@@ -1402,13 +1404,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
-def serve(open_browser: bool = True) -> None:
+def serve(open_browser: bool = True, host: str | None = None, port: int | None = None) -> None:
+    host = host or BIND_HOST
+    port = int(port or PORT)
     write_dashboard(auto_refresh=True)
-    httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    url = f"http://127.0.0.1:{PORT}/"
-    print(f"Dashboard + charts → {url}")
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    url = f"http://{host}:{port}/"
+    print(f"Dashboard + charts → {url} (bind={host})")
     print("Ctrl+C pour arrêter.")
-    if open_browser:
+    if open_browser and host in ("127.0.0.1", "localhost"):
         webbrowser.open(url)
     try:
         httpd.serve_forever()
@@ -1422,10 +1426,12 @@ def main() -> None:
     ap.add_argument("--serve", action="store_true")
     ap.add_argument("--no-open", action="store_true")
     ap.add_argument("--no-ohlc", action="store_true")
+    ap.add_argument("--host", default=None, help="Bind host (default BIND_HOST or 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=None, help="Port (default PORT env or 8765)")
     args = ap.parse_args()
 
     if args.serve:
-        serve(open_browser=not args.no_open)
+        serve(open_browser=not args.no_open, host=args.host, port=args.port)
         return
 
     path = write_dashboard(auto_refresh=False, use_ohlc=not args.no_ohlc)

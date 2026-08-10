@@ -1,0 +1,2 @@
+# Pure stdlib app (urllib, json, hmac…). No third-party deps required.
+# File present so Fly/Docker/Railway detect a Python project.
