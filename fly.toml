@@ -13,7 +13,8 @@
 #     --volume scanner_data:/data --restart no
 
 app = "shitcoin-scanner"
-primary_region = "fra"
+# fra (Germany) is geo-blocked by Bybit CloudFront → use sin/nrt for API
+primary_region = "sin"
 
 [build]
   # Explicit — required so Fly never "detects" empty source
@@ -47,8 +48,8 @@ primary_region = "fra"
   cpu_kind = "shared"
   cpus = 1
 
-# Create once before first deploy:
-#   fly volumes create scanner_data --region fra --size 1 -a shitcoin-scanner
+# Create once before first deploy (Bybit needs non-DE region, e.g. sin):
+#   fly volumes create scanner_data_sin --region sin --size 1 -a shitcoin-scanner
 [mounts]
-  source = "scanner_data"
+  source = "scanner_data_sin"
   destination = "/data"
