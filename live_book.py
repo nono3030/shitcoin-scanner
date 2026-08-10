@@ -2,37 +2,43 @@
 """
 Live trading book — FADE-BLOWOFF-T3 on Bybit linear USDT perps.
 
-- Scan signals stay Kraken-derived (pair = BASE/USD)
-- Execution maps to Bybit PAIRUSDT via broker_bybit
-- SHORT market, exit time-only after hold_days daily bars
-- Compounding on live equity when COMPOUNDING=True
-- Kill if equity < MIN_EQUITY_USD
+Timing (daily UTC, aligned with backtest):
+  1. Signal on last *closed* Kraken daily bar
+  2. Queue pending (no order yet)
+  3. fill_opens → market short when next daily open exists
+  4. close_due → reduceOnly after hold_days daily bars
 
-State: live/open_positions.json  ·  Ledger: live/ledger.jsonl
+Exchange orders only inside LIVE_TRADE_UTC_* window (post daily close),
+unless force_trade=True / --force-trade / env LIVE_FORCE_TRADE=1.
 
 Usage:
   python live_book.py status
   python live_book.py close-due
-  python live_book.py open-from-signals   # uses out/fade_signals_latest.json
+  python live_book.py fill-opens
+  python live_book.py open-from-signals
+  python live_book.py open-from-signals --force-trade
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from config import (
     COMPOUNDING,
+    ENTRY_MODE,
     EQUITY_USD,
     HOLD_DAYS,
     LEVERAGE,
     LIVE_DIR,
     LIVE_LEDGER,
     LIVE_STATE,
+    LIVE_TRADE_UTC_END_HOUR,
+    LIVE_TRADE_UTC_START_HOUR,
     MAX_OPEN_POSITIONS,
     MIN_EQUITY_USD,
     SIGNALS_FILE,
@@ -46,6 +52,30 @@ from kraken_data import load_or_refresh
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def in_trade_window(force: bool = False, now: datetime | None = None) -> tuple[bool, str]:
+    """
+    True if exchange entries/exits are allowed.
+    Window is [LIVE_TRADE_UTC_START_HOUR, LIVE_TRADE_UTC_END_HOUR) UTC.
+    """
+    if force or os.environ.get("LIVE_FORCE_TRADE", "").strip() in ("1", "true", "yes"):
+        return True, "forced"
+    n = now or _utc_now()
+    h = n.hour
+    start = int(LIVE_TRADE_UTC_START_HOUR)
+    end = int(LIVE_TRADE_UTC_END_HOUR)
+    if start <= h < end:
+        return True, f"in_window {start:02d}:00-{end:02d}:00Z (now {h:02d}:{n.minute:02d}Z)"
+    return (
+        False,
+        f"outside trade window {start:02d}:00-{end:02d}:00Z "
+        f"(now {h:02d}:{n.minute:02d}Z) — use --force-trade to override",
+    )
 
 
 def _load_state() -> dict[str, Any]:
@@ -74,7 +104,7 @@ def _append_ledger(event: dict[str, Any]) -> None:
 
 
 def _openish(state: dict[str, Any]) -> list[dict[str, Any]]:
-    return [p for p in state.get("positions", []) if p.get("status") == "open"]
+    return [p for p in state.get("positions", []) if p.get("status") in ("pending", "open")]
 
 
 def _bars_since_entry(pair: str, entry_date: str, ohlc: dict) -> tuple[int, float | None, str | None]:
@@ -84,6 +114,26 @@ def _bars_since_entry(pair: str, entry_date: str, ohlc: dict) -> tuple[int, floa
         return 0, None, None
     last = bars[-1]
     return len(bars), last.c, last.date
+
+
+def _last_closed_date(series: list) -> str | None:
+    """Last fully closed UTC daily bar (skip in-progress 'today' bar)."""
+    if not series:
+        return None
+    today = _utc_now().strftime("%Y-%m-%d")
+    last = series[-1]
+    if last.date == today and len(series) >= 2:
+        return series[-2].date
+    return last.date
+
+
+def _entry_bar_after_signal(pair: str, signal_date: str, ohlc: dict):
+    """First daily bar strictly after signal_date (= next open for time-series)."""
+    series = ohlc.get(pair) or []
+    for c in series:
+        if c.date > signal_date:
+            return c
+    return None
 
 
 def _live_equity(broker: BybitBroker) -> float:
@@ -114,33 +164,39 @@ def check_kill(broker: BybitBroker | None = None, state: dict[str, Any] | None =
         st["killed"] = True
         st["kill_reason"] = reason
         st["killed_at"] = _now()
-        if state is not None:
-            _save_state(st)
-        else:
-            _save_state(st)
+        _save_state(st)
         _append_ledger({"ts": _now(), "event": "kill_switch", "equity": eq, "reason": reason})
         return True, eq, reason
 
-    # clear kill if equity recovered (optional safety — stay killed once tripped)
     return bool(st.get("killed")), eq, st.get("kill_reason")
 
 
 def open_from_signals(
     signals: list[dict] | None = None,
     broker: BybitBroker | None = None,
+    force_trade: bool = False,
 ) -> dict[str, Any]:
     """
-    Rank signals by ret_3d desc, open market shorts up to MAX_OPEN_POSITIONS.
-    Sizing: position_notional(live equity) when COMPOUNDING else start equity.
+    Rank signals by ret_3d, queue up to MAX_OPEN_POSITIONS.
+
+    ENTRY_MODE=next_open  → status=pending only (fill later at next open)
+    ENTRY_MODE=at_close   → market if signal is on last closed bar AND in trade window
+    ENTRY_MODE=immediate  → market now (legacy)
     """
     br = broker or default_broker()
     state = _load_state()
-    summary: dict[str, Any] = {"opened": [], "skipped": [], "killed": False}
+    mode = (ENTRY_MODE or "next_open").strip().lower()
+    summary: dict[str, Any] = {
+        "queued": [],
+        "opened": [],
+        "skipped": [],
+        "killed": False,
+        "entry_mode": mode,
+    }
 
     killed, equity, reason = check_kill(br, state)
     if killed:
-        msg = f"KILL active — no new opens ({reason})"
-        print(msg)
+        print(f"KILL active — no new opens ({reason})")
         summary["killed"] = True
         summary["kill_reason"] = reason
         summary["equity"] = equity
@@ -153,6 +209,7 @@ def open_from_signals(
         payload = json.loads(SIGNALS_FILE.read_text(encoding="utf-8"))
         signals = payload.get("signals") or []
 
+    ohlc, _ = load_or_refresh(refresh=False)
     openish = _openish(state)
     slots = max(0, MAX_OPEN_POSITIONS - len(openish))
     if slots == 0:
@@ -162,7 +219,6 @@ def open_from_signals(
 
     existing_pairs = {p["pair"] for p in openish}
     existing_symbols = {p.get("bybit_symbol") for p in openish if p.get("bybit_symbol")}
-    # also respect exchange-side positions
     try:
         for ep in br.list_open_positions():
             if ep.get("symbol"):
@@ -170,22 +226,20 @@ def open_from_signals(
     except Exception as e:
         print(f"  warn: list_open_positions failed: {e}")
 
-    ranked = sorted(
-        signals,
-        key=lambda s: float(s.get("ret_3d") or 0.0),
-        reverse=True,
-    )
+    ranked = sorted(signals, key=lambda s: float(s.get("ret_3d") or 0.0), reverse=True)
     rule = active_rule()
     eq_for_size = _sizing_equity(br, state)
     notional = position_notional(eq_for_size)
+    ok_win, win_msg = in_trade_window(force=force_trade)
     print(
-        f"LIVE open_from_signals equity=${eq_for_size:.2f} "
-        f"notional=${notional:.2f} slots={slots} signals={len(ranked)}"
+        f"LIVE open_from_signals mode={mode} equity=${eq_for_size:.2f} "
+        f"notional=${notional:.2f} slots={slots} signals={len(ranked)} | {win_msg}"
     )
 
+    queued = 0
     opened = 0
     for s in ranked:
-        if opened >= slots:
+        if queued + opened >= slots:
             break
         pair = s.get("pair")
         if not pair:
@@ -202,7 +256,69 @@ def open_from_signals(
             summary["skipped"].append({"pair": pair, "symbol": symbol, "reason": "already_on_exchange"})
             continue
 
-        # re-check equity kill before each order
+        signal_date = s.get("signal_date")
+        series = ohlc.get(pair) or []
+        last_closed = _last_closed_date(series)
+
+        # --- next_open: queue only ---
+        if mode == "next_open":
+            pos = {
+                "id": str(uuid.uuid4())[:8],
+                "pair": pair,
+                "bybit_symbol": symbol,
+                "status": "pending",
+                "side": "short",
+                "rule": rule.name,
+                "signal_date": signal_date,
+                "signal_close": s.get("close"),
+                "ret_3d": s.get("ret_3d"),
+                "rsi14": s.get("rsi14"),
+                "vol_spike": s.get("vol_spike"),
+                "dist_sma20": s.get("dist_sma20"),
+                "notional_usd": notional,
+                "qty": None,
+                "leverage": LEVERAGE,
+                "hold_days": int(s.get("hold_days") or HOLD_DAYS),
+                "entry_date": None,
+                "entry_px": None,
+                "entry_order_id": None,
+                "exit_date": None,
+                "exit_px": None,
+                "exit_order_id": None,
+                "bars_held": 0,
+                "realized_pnl_usd": None,
+                "realized_pnl_pct": None,
+                "created_at": _now(),
+                "entry_mode": mode,
+            }
+            state["positions"].append(pos)
+            existing_pairs.add(pair)
+            existing_symbols.add(symbol)
+            queued += 1
+            summary["queued"].append({"id": pos["id"], "pair": pair, "symbol": symbol, "signal_date": signal_date})
+            _append_ledger({"ts": _now(), "event": "signal_queued", "position": pos})
+            print(f"  QUEUED pending short {pair}→{symbol} signal={signal_date} id={pos['id']}")
+            continue
+
+        # --- at_close / immediate: may place market ---
+        if mode == "at_close":
+            if not signal_date or not last_closed or signal_date != last_closed:
+                summary["skipped"].append({
+                    "pair": pair,
+                    "reason": "stale_or_not_close_bar",
+                    "signal_date": signal_date,
+                    "last_closed": last_closed,
+                })
+                continue
+            if not ok_win:
+                summary["skipped"].append({"pair": pair, "reason": "outside_window", "detail": win_msg})
+                continue
+
+        if mode == "immediate" and not ok_win and not force_trade:
+            # still allow queue as pending instead of silent skip
+            summary["skipped"].append({"pair": pair, "reason": "outside_window_use_next_open_or_force", "detail": win_msg})
+            continue
+
         killed, equity, reason = check_kill(br, state)
         if killed:
             print(f"KILL before order: {reason}")
@@ -212,21 +328,12 @@ def open_from_signals(
 
         eq_for_size = _sizing_equity(br, state)
         notional = position_notional(eq_for_size)
-
         try:
             order = br.open_short(symbol, notional)
         except Exception as e:
             print(f"  FAIL open short {pair}→{symbol}: {e}")
             summary["skipped"].append({"pair": pair, "symbol": symbol, "reason": str(e)})
-            _append_ledger(
-                {
-                    "ts": _now(),
-                    "event": "open_failed",
-                    "pair": pair,
-                    "symbol": symbol,
-                    "error": str(e),
-                }
-            )
+            _append_ledger({"ts": _now(), "event": "open_failed", "pair": pair, "symbol": symbol, "error": str(e)})
             continue
 
         entry_px = None
@@ -235,6 +342,8 @@ def open_from_signals(
         except Exception:
             entry_px = float(s.get("close") or 0) or None
 
+        # at_close: entry_date = signal_date (close process)
+        entry_date = signal_date if mode == "at_close" else _utc_now().strftime("%Y-%m-%d")
         pos = {
             "id": str(uuid.uuid4())[:8],
             "pair": pair,
@@ -242,7 +351,7 @@ def open_from_signals(
             "status": "open",
             "side": "short",
             "rule": rule.name,
-            "signal_date": s.get("signal_date"),
+            "signal_date": signal_date,
             "signal_close": s.get("close"),
             "ret_3d": s.get("ret_3d"),
             "rsi14": s.get("rsi14"),
@@ -252,8 +361,8 @@ def open_from_signals(
             "qty": order.get("qty"),
             "leverage": LEVERAGE,
             "hold_days": int(s.get("hold_days") or HOLD_DAYS),
-            "entry_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "entry_px": entry_px,
+            "entry_date": entry_date,
+            "entry_px": entry_px if mode != "at_close" else (s.get("close") or entry_px),
             "entry_order_id": order.get("orderId"),
             "exit_date": None,
             "exit_px": None,
@@ -262,35 +371,155 @@ def open_from_signals(
             "realized_pnl_usd": None,
             "realized_pnl_pct": None,
             "created_at": _now(),
+            "entry_mode": mode,
         }
         state["positions"].append(pos)
         existing_pairs.add(pair)
         existing_symbols.add(symbol)
         opened += 1
         summary["opened"].append({"id": pos["id"], "pair": pair, "symbol": symbol, "notional": notional})
-        _append_ledger({"ts": _now(), "event": "opened_short", "position": pos, "order": {
-            k: order.get(k) for k in ("orderId", "qty", "notional_usd", "symbol", "side")
-        }})
+        _append_ledger({
+            "ts": _now(),
+            "event": "opened_short",
+            "position": pos,
+            "order": {k: order.get(k) for k in ("orderId", "qty", "notional_usd", "symbol", "side")},
+        })
         print(
             f"  OPENED short {pair}→{symbol} id={pos['id']} "
             f"qty={pos['qty']} notional=${notional:.2f} orderId={order.get('orderId')}"
         )
 
     _save_state(state)
-    if opened == 0 and not summary["killed"]:
-        print("No new live positions opened.")
-    summary["equity"] = equity if "equity" in summary else eq_for_size
+    if queued == 0 and opened == 0 and not summary["killed"]:
+        print("No new live positions queued/opened.")
+    summary["equity"] = equity
+    summary["queued_n"] = queued
     summary["opened_n"] = opened
     return summary
 
 
-def close_due(broker: BybitBroker | None = None) -> dict[str, Any]:
-    """Close shorts when bars_held >= hold_days (Kraken OHLC bar count)."""
+def fill_opens(broker: BybitBroker | None = None, force_trade: bool = False) -> dict[str, Any]:
+    """
+    Fill pending shorts at next daily open (first OHLC bar after signal_date).
+    Market order on Bybit only inside trade window (post close) unless forced.
+    """
+    br = broker or default_broker()
+    state = _load_state()
+    ohlc, _ = load_or_refresh(refresh=False)
+    summary: dict[str, Any] = {"filled": [], "waiting": [], "skipped": []}
+
+    ok_win, win_msg = in_trade_window(force=force_trade)
+    print(f"LIVE fill_opens | {win_msg}")
+    if not ok_win:
+        n_pend = sum(1 for p in state.get("positions", []) if p.get("status") == "pending")
+        print(f"  skip exchange fills ({n_pend} pending left).")
+        summary["skipped"].append({"reason": "outside_window", "detail": win_msg, "pending": n_pend})
+        # still report waiting reasons without trading
+        for p in state.get("positions", []):
+            if p.get("status") != "pending":
+                continue
+            bar = _entry_bar_after_signal(p["pair"], p.get("signal_date") or "", ohlc)
+            if bar is None:
+                summary["waiting"].append({"pair": p["pair"], "reason": "next_open_not_in_ohlc_yet"})
+            else:
+                summary["waiting"].append({
+                    "pair": p["pair"],
+                    "reason": "ready_but_outside_window",
+                    "entry_date": bar.date,
+                })
+        return summary
+
+    killed, equity, reason = check_kill(br, state)
+    if killed:
+        print(f"KILL — no fills ({reason})")
+        summary["killed"] = True
+        summary["kill_reason"] = reason
+        return summary
+
+    filled = 0
+    for p in state.get("positions", []):
+        if p.get("status") != "pending":
+            continue
+        pair = p["pair"]
+        signal_date = p.get("signal_date")
+        if not signal_date:
+            summary["skipped"].append({"pair": pair, "reason": "no_signal_date"})
+            continue
+
+        entry_bar = _entry_bar_after_signal(pair, signal_date, ohlc)
+        if entry_bar is None:
+            print(f"  wait {pair}: next open after {signal_date} not in OHLC yet")
+            summary["waiting"].append({"pair": pair, "signal_date": signal_date})
+            continue
+
+        symbol = p.get("bybit_symbol") or kraken_to_bybit_symbol(pair)
+        eq_for_size = _sizing_equity(br, state)
+        notional = float(p.get("notional_usd") or position_notional(eq_for_size))
+        # refresh notional on fill if compounding
+        if COMPOUNDING:
+            notional = position_notional(eq_for_size)
+            p["notional_usd"] = notional
+
+        try:
+            order = br.open_short(symbol, notional)
+        except Exception as e:
+            print(f"  FAIL fill {pair}→{symbol}: {e}")
+            summary["skipped"].append({"pair": pair, "symbol": symbol, "reason": str(e)})
+            _append_ledger({"ts": _now(), "event": "fill_failed", "pair": pair, "symbol": symbol, "error": str(e)})
+            continue
+
+        entry_px = float(entry_bar.o)  # theoretical next open
+        try:
+            # live fill is market; keep open as reference, store both
+            mkt = br.get_ticker_price(symbol)
+        except Exception:
+            mkt = entry_px
+
+        p["status"] = "open"
+        p["entry_date"] = entry_bar.date
+        p["entry_px"] = mkt
+        p["entry_px_open_ref"] = entry_px
+        p["qty"] = order.get("qty")
+        p["entry_order_id"] = order.get("orderId")
+        p["bars_held"] = 0
+        p["filled_at"] = _now()
+        filled += 1
+        summary["filled"].append({
+            "id": p.get("id"),
+            "pair": pair,
+            "symbol": symbol,
+            "entry_date": p["entry_date"],
+            "entry_px": p["entry_px"],
+            "orderId": order.get("orderId"),
+        })
+        _append_ledger({
+            "ts": _now(),
+            "event": "filled_short",
+            "position": dict(p),
+            "order": {k: order.get(k) for k in ("orderId", "qty", "notional_usd", "symbol", "side")},
+        })
+        print(
+            f"  FILLED short {pair}→{symbol} entry_date={p['entry_date']} "
+            f"open_ref={entry_px} mkt={mkt} qty={p['qty']} orderId={order.get('orderId')}"
+        )
+
+    _save_state(state)
+    print(f"Filled {filled} pending → open.")
+    summary["filled_n"] = filled
+    summary["equity"] = equity
+    return summary
+
+
+def close_due(broker: BybitBroker | None = None, force_trade: bool = False) -> dict[str, Any]:
+    """Close shorts when bars_held >= hold_days. Exchange close only in trade window."""
     br = broker or default_broker()
     state = _load_state()
     ohlc, _ = load_or_refresh(refresh=False)
     closed = 0
-    summary: dict[str, Any] = {"closed": [], "held": []}
+    summary: dict[str, Any] = {"closed": [], "held": [], "deferred": []}
+
+    ok_win, win_msg = in_trade_window(force=force_trade)
+    print(f"LIVE close_due | {win_msg}")
 
     for p in state.get("positions", []):
         if p.get("status") != "open":
@@ -307,47 +536,55 @@ def close_due(broker: BybitBroker | None = None) -> dict[str, Any]:
             summary["held"].append({"pair": pair, "bars": n, "hold": hold})
             continue
 
+        if not ok_win:
+            summary["deferred"].append({"pair": pair, "bars": n, "hold": hold, "reason": win_msg})
+            print(f"  defer close {pair}: bars={n}/{hold} but {win_msg}")
+            continue
+
         symbol = p.get("bybit_symbol") or kraken_to_bybit_symbol(pair)
         qty = p.get("qty")
         try:
             order = br.close_short(symbol, qty=qty)
         except Exception as e:
-            # retry full size from exchange
             try:
                 order = br.close_short(symbol, qty=None)
             except Exception as e2:
                 print(f"  FAIL close {pair}→{symbol}: {e2}")
-                _append_ledger(
-                    {
-                        "ts": _now(),
-                        "event": "close_failed",
-                        "pair": pair,
-                        "symbol": symbol,
-                        "error": str(e2),
-                        "prev_error": str(e),
-                    }
-                )
+                _append_ledger({
+                    "ts": _now(),
+                    "event": "close_failed",
+                    "pair": pair,
+                    "symbol": symbol,
+                    "error": str(e2),
+                    "prev_error": str(e),
+                })
                 continue
 
-        exit_px = None
+        # Prefer hold_days-th bar close for bookkeeping
+        series = ohlc.get(pair) or []
+        bars = [c for c in series if c.date >= entry_date]
+        exit_bar = bars[hold - 1] if len(bars) >= hold else (bars[-1] if bars else None)
+        exit_px_ref = exit_bar.c if exit_bar else last_c
+        exit_date = exit_bar.date if exit_bar else last_d
+
         try:
             exit_px = br.get_ticker_price(symbol)
         except Exception:
-            exit_px = last_c
+            exit_px = exit_px_ref
 
         entry_px = p.get("entry_px")
         net = None
         pnl_usd = None
         if entry_px and exit_px and float(entry_px) > 0:
-            # short PnL
             gross = (float(entry_px) - float(exit_px)) / float(entry_px)
-            net = gross  # live fees already on exchange; estimate without FEE_RT
+            net = gross
             notional = float(p.get("notional_usd") or 0)
             pnl_usd = net * notional
 
         p["status"] = "closed"
-        p["exit_date"] = last_d or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        p["exit_date"] = exit_date or _utc_now().strftime("%Y-%m-%d")
         p["exit_px"] = exit_px
+        p["exit_px_close_ref"] = exit_px_ref
         p["exit_order_id"] = order.get("orderId")
         p["realized_pnl_pct"] = net
         p["realized_pnl_usd"] = pnl_usd
@@ -355,14 +592,12 @@ def close_due(broker: BybitBroker | None = None) -> dict[str, Any]:
         if pnl_usd is not None:
             state["cash_pnl"] = float(state.get("cash_pnl") or 0.0) + pnl_usd
         closed += 1
-        summary["closed"].append(
-            {
-                "pair": pair,
-                "symbol": symbol,
-                "pnl_usd": pnl_usd,
-                "orderId": order.get("orderId"),
-            }
-        )
+        summary["closed"].append({
+            "pair": pair,
+            "symbol": symbol,
+            "pnl_usd": pnl_usd,
+            "orderId": order.get("orderId"),
+        })
         _append_ledger({"ts": _now(), "event": "closed_time_exit", "position": dict(p)})
         print(
             f"  CLOSED {pair}→{symbol} bars={n}/{hold} "
@@ -374,6 +609,7 @@ def close_due(broker: BybitBroker | None = None) -> dict[str, Any]:
     _save_state(state)
     print(f"Closed {closed}. est_cash_pnl=${state.get('cash_pnl', 0):+.2f}")
     summary["closed_n"] = closed
+    summary["window_ok"] = ok_win
     return summary
 
 
@@ -390,12 +626,14 @@ def status(broker: BybitBroker | None = None) -> None:
     except Exception as e:
         err = str(e)
 
+    ok_win, win_msg = in_trade_window(force=False)
     print("=" * 72)
     print(f"LIVE BOOK  {profile_summary()}")
     print(f"equity_start=${state.get('equity_start', EQUITY_USD):.2f}  "
           f"est_realized_pnl=${state.get('cash_pnl', 0):+.2f}")
     if equity is not None:
         print(f"live_equity_usdt=${equity:.4f}  MIN_EQUITY=${MIN_EQUITY_USD:.2f}")
+    print(f"trade_window: {'OPEN' if ok_win else 'CLOSED'} — {win_msg}")
     if state.get("killed"):
         print(f"*** KILLED *** {state.get('kill_reason')}")
     if err:
@@ -403,9 +641,16 @@ def status(broker: BybitBroker | None = None) -> None:
     print(f"Rule: {active_rule().describe()}")
     print("=" * 72)
 
-    by: dict[str, list] = {"open": [], "closed": []}
+    by: dict[str, list] = {"pending": [], "open": [], "closed": []}
     for p in state.get("positions", []):
         by.setdefault(p.get("status") or "?", []).append(p)
+
+    print(f"\n[PENDING] n={len(by.get('pending') or [])}  (signaled, wait next open + window)")
+    for p in (by.get("pending") or [])[-20:]:
+        print(
+            f"  {p.get('id')} {p.get('pair'):<12} → {p.get('bybit_symbol')}  "
+            f"signal={p.get('signal_date')} ret3d={p.get('ret_3d')}"
+        )
 
     print(f"\n[OPEN] n={len(by.get('open') or [])}")
     for p in (by.get("open") or [])[-20:]:
@@ -446,8 +691,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Live book for fade shorts (Bybit)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
-    sub.add_parser("close-due")
-    sub.add_parser("open-from-signals")
+    p_close = sub.add_parser("close-due")
+    p_close.add_argument("--force-trade", action="store_true", help="Ignore UTC trade window")
+    p_fill = sub.add_parser("fill-opens")
+    p_fill.add_argument("--force-trade", action="store_true")
+    p_open = sub.add_parser("open-from-signals")
+    p_open.add_argument("--force-trade", action="store_true")
     p_reset = sub.add_parser("reset")
     p_reset.add_argument("--force", action="store_true")
     args = ap.parse_args()
@@ -455,9 +704,11 @@ def main() -> None:
     if args.cmd == "status":
         status()
     elif args.cmd == "close-due":
-        close_due()
+        close_due(force_trade=args.force_trade)
+    elif args.cmd == "fill-opens":
+        fill_opens(force_trade=args.force_trade)
     elif args.cmd == "open-from-signals":
-        open_from_signals()
+        open_from_signals(force_trade=args.force_trade)
     elif args.cmd == "reset":
         reset(force=args.force)
 

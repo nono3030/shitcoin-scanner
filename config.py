@@ -47,6 +47,18 @@ FULL_AUTO = True
 # Execution mode: "paper" | "live"
 EXECUTION_MODE = "live"
 
+# --- Timing live (daily UTC, pas "dès que le script tourne") ---
+# Rule: signal on closed daily bar → SHORT next daily open → exit after HOLD_DAYS bars.
+# ENTRY_MODE:
+#   "next_open"  = queue pending on signal, market fill when next daily bar exists (backtest)
+#   "at_close"   = market enter only if signal_date == last fully closed bar (EOD job)
+#   "immediate"  = market as soon as script sees signal (legacy / avoid)
+ENTRY_MODE = "next_open"
+# Exchange orders (fill + time-exit) only in this UTC hour window, unless --force-trade.
+# Daily close = 00:00 UTC → recommended run 00:05–03:00 UTC (ex: 02:30 Paris été = 00:30 UTC).
+LIVE_TRADE_UTC_START_HOUR = 0
+LIVE_TRADE_UTC_END_HOUR = 4  # [start, end) exclusive end
+
 # Kill-switches
 MAX_DAILY_LOSS_PCT = 0.20
 MAX_DRAWDOWN_PCT = 0.70  # profile MDD ~67%, leave a bit of room
@@ -124,5 +136,7 @@ def profile_summary() -> str:
         f"{PROFILE_NAME} | equity=${eq:.0f} | {MARGIN_MODE} {LEVERAGE}x | "
         f"risk {RISK_PCT_PER_TRADE*100:.0f}% (margin ${margin_usd(eq):.2f}, "
         f"notional ${position_notional(eq):.2f}) | max_pos={MAX_OPEN_POSITIONS} | "
-        f"mode={EXECUTION_MODE} auto={FULL_AUTO} compound={COMPOUNDING}"
+        f"mode={EXECUTION_MODE} entry={ENTRY_MODE} "
+        f"window={LIVE_TRADE_UTC_START_HOUR:02d}-{LIVE_TRADE_UTC_END_HOUR:02d}Z | "
+        f"auto={FULL_AUTO} compound={COMPOUNDING}"
     )
