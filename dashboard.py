@@ -622,7 +622,12 @@ def build_payload(use_ohlc: bool = True) -> dict:
         live_eq = float(exchange.get("equity_usdt") or 0)
         ex_upnl = sum(float(p.get("unrealisedPnl") or 0) for p in (exchange.get("positions") or []))
 
-    equity_start = float((state or {}).get("equity_start") or (EQUITY_USD if live else PAPER_EQUITY_USD))
+    # Live: always use config EQUITY_USD as start (deposit baseline for honest PnL).
+    # Paper: prefer state, fallback config.
+    if live:
+        equity_start = float(EQUITY_USD)
+    else:
+        equity_start = float((state or {}).get("equity_start") or PAPER_EQUITY_USD)
     stats = stats_from_positions(
         positions,
         cash_pnl=float((state or {}).get("cash_pnl") or 0),

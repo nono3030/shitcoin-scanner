@@ -33,13 +33,14 @@ FEE_RT = 0.0052
 STRICT_VOL5 = False
 
 # =============================================================================
-# PROFIL A LIVE — risk 5% · 2x · max 4 · equity $50 · Bybit linear USDT
+# PROFIL A LIVE — risk 5% · 2x · max 4 · equity $55 · Bybit linear USDT
 #   notional = 10% equity / trade · gross max 40%
 #   Scan: Kraken USD alts · Exec: Bybit perps (AI sub-account)
+#   equity_start = 55 so dashboard PnL matches real deposit (e.g. $62 → +$7)
 # =============================================================================
 PROFILE_NAME = "A_RISK5_L2_MAX4_LIVE"
 
-EQUITY_USD = 50.0
+EQUITY_USD = 55.0
 RISK_PCT_PER_TRADE = 0.05  # 5% margin per trade
 MARGIN_MODE = "cross"
 LEVERAGE = 2

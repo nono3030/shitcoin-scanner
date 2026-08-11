@@ -89,7 +89,15 @@ def _load_state() -> dict[str, Any]:
             "cash_pnl": 0.0,
             "positions": [],
         }
-    return json.loads(LIVE_STATE.read_text(encoding="utf-8"))
+    state = json.loads(LIVE_STATE.read_text(encoding="utf-8"))
+    # Keep start capital aligned with config (dashboard PnL = live_eq - equity_start)
+    if float(state.get("equity_start") or 0) != float(EQUITY_USD):
+        state["equity_start"] = float(EQUITY_USD)
+        try:
+            _save_state(state)
+        except Exception:
+            pass
+    return state
 
 
 def _save_state(state: dict[str, Any]) -> None:
