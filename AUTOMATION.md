@@ -10,9 +10,11 @@
 | Max pos | **3** |
 | Hold | 3 daily bars time-exit |
 | Signal | FADE-BLOWOFF-T3 |
-| Exec | `paper` d’abord (`config.EXECUTION_MODE`) |
+| Exec | `live` Bybit (`config.EXECUTION_MODE`) |
+| DCA soft | **ON** — add short +10%/+20% adverse, max **2×** first leg, block if account DD ≥ **35%** |
 
-Backtest sample ~23m : CAGR ~**+124%**, MDD ~**-67%**, Y2025 ~**+75%**.
+Backtest sample ~23m (single) : CAGR ~**+124%**, MDD ~**-67%**.  
+Portfolio sim DCA soft : upside ↑, MDD ~**-57%** (stress high ~-70%).
 
 ---
 

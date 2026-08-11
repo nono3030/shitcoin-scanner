@@ -130,15 +130,29 @@ def step_live(signals: list[dict], dry: bool, force_trade: bool = False) -> None
         log("FULL_AUTO=False — signals logged only (live)")
         return
 
-    from live_book import check_kill, close_due, fill_opens, in_trade_window, open_from_signals
+    from config import DCA_ENABLED, DCA_LEVELS, DCA_MAX_SIZE, DCA_BLOCK_DD
+    from live_book import (
+        check_kill,
+        close_due,
+        fill_opens,
+        in_trade_window,
+        open_from_signals,
+        process_dca,
+    )
     from broker_bybit import default_broker
 
     ok_win, win_msg = in_trade_window(force=force_trade)
+    dca_txt = (
+        f"DCA +{'/'.join(str(int(x*100))+'%' for x in DCA_LEVELS)} max={DCA_MAX_SIZE}x "
+        f"block_dd={DCA_BLOCK_DD*100:.0f}%"
+        if DCA_ENABLED
+        else "DCA off"
+    )
     log(
         f"LIVE path | entry={ENTRY_MODE} | window "
         f"{LIVE_TRADE_UTC_START_HOUR:02d}-{LIVE_TRADE_UTC_END_HOUR:02d}Z | "
         f"{win_msg} | max_pos={MAX_OPEN_POSITIONS} compound={COMPOUNDING} "
-        f"min_eq=${MIN_EQUITY_USD}"
+        f"min_eq=${MIN_EQUITY_USD} | {dca_txt}"
     )
     if not ok_win:
         log(
@@ -173,6 +187,20 @@ def step_live(signals: list[dict], dry: bool, force_trade: bool = False) -> None
         f"LIVE fill_opens#1 filled={fill1.get('filled_n', 0)} "
         f"waiting={len(fill1.get('waiting') or [])}"
     )
+
+    # 2b) soft DCA on open shorts in drawdown (+10%/+20%, cap 2x)
+    dca_summary = process_dca(broker=br, force_trade=force_trade)
+    log(
+        f"LIVE process_dca enabled={dca_summary.get('enabled')} "
+        f"added={dca_summary.get('added_n', 0)} "
+        f"blocked_dd={dca_summary.get('blocked_dd', 0)} "
+        f"skipped={len(dca_summary.get('skipped') or [])}"
+    )
+    for a in dca_summary.get("added") or []:
+        log(
+            f"  dca {a.get('pair')} thr=+{float(a.get('threshold') or 0)*100:.0f}% "
+            f"notional=${a.get('add_notional')} size={a.get('size_units')}x"
+        )
 
     # 3) queue new signals (pending if next_open — no immediate market)
     open_summary = open_from_signals(signals, broker=br, force_trade=force_trade)

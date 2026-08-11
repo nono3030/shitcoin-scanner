@@ -6,7 +6,8 @@ Timing (daily UTC, aligned with backtest):
   1. Signal on last *closed* Kraken daily bar
   2. Queue pending (no order yet)
   3. fill_opens → market short when next daily open exists
-  4. close_due → reduceOnly after hold_days daily bars
+  4. process_dca → soft add short at +10%/+20% adverse (cap 2×), if enabled
+  5. close_due → reduceOnly after hold_days daily bars
 
 Exchange orders only inside LIVE_TRADE_UTC_* window (post daily close),
 unless force_trade=True / --force-trade / env LIVE_FORCE_TRADE=1.
@@ -30,6 +31,11 @@ from typing import Any
 
 from config import (
     COMPOUNDING,
+    DCA_ADD_SIZE,
+    DCA_BLOCK_DD,
+    DCA_ENABLED,
+    DCA_LEVELS,
+    DCA_MAX_SIZE,
     ENTRY_MODE,
     EQUITY_USD,
     HOLD_DAYS,
@@ -146,6 +152,58 @@ def _entry_bar_after_signal(pair: str, signal_date: str, ohlc: dict):
 
 def _live_equity(broker: BybitBroker) -> float:
     return float(broker.get_equity_usdt())
+
+
+def _update_equity_peak(state: dict[str, Any], equity: float) -> float:
+    """Track peak equity for account DD (DCA block). Returns current DD (negative or 0)."""
+    peak = float(state.get("equity_peak") or state.get("equity_start") or EQUITY_USD)
+    peak = max(peak, equity)
+    state["equity_peak"] = peak
+    if peak <= 0:
+        return 0.0
+    return equity / peak - 1.0
+
+
+def _init_dca_fields(pos: dict[str, Any]) -> None:
+    """Ensure DCA tracking fields exist on a position."""
+    if pos.get("dca_size_units") is None:
+        pos["dca_size_units"] = 1.0
+    if pos.get("dca_levels_hit") is None:
+        pos["dca_levels_hit"] = []
+    if pos.get("dca_legs") is None:
+        legs = []
+        if pos.get("entry_px") and pos.get("notional_usd"):
+            legs.append({
+                "leg": 0,
+                "price": pos.get("entry_px"),
+                "notional_usd": pos.get("notional_usd"),
+                "qty": pos.get("qty"),
+                "order_id": pos.get("entry_order_id"),
+                "ts": pos.get("filled_at") or pos.get("created_at"),
+            })
+        pos["dca_legs"] = legs
+    if pos.get("first_notional_usd") is None:
+        pos["first_notional_usd"] = pos.get("notional_usd")
+    if pos.get("first_entry_px") is None:
+        pos["first_entry_px"] = pos.get("entry_px")
+
+
+def _adverse_vs_first(pos: dict[str, Any], last_px: float, ohlc: dict) -> float:
+    """
+    Adverse move for short = price up vs first entry.
+    Use max(live last, max Kraken daily high since entry_date) when available.
+    """
+    first = float(pos.get("first_entry_px") or pos.get("entry_px") or 0)
+    if first <= 0:
+        return 0.0
+    high = last_px
+    entry_date = pos.get("entry_date") or ""
+    pair = pos.get("pair") or ""
+    series = ohlc.get(pair) or []
+    for c in series:
+        if entry_date and c.date >= entry_date:
+            high = max(high, float(c.h))
+    return (high - first) / first
 
 
 def _sizing_equity(broker: BybitBroker, state: dict[str, Any]) -> float:
@@ -298,6 +356,11 @@ def open_from_signals(
                 "realized_pnl_pct": None,
                 "created_at": _now(),
                 "entry_mode": mode,
+                "dca_size_units": 1.0,
+                "dca_levels_hit": [],
+                "dca_legs": [],
+                "first_notional_usd": notional,
+                "first_entry_px": None,
             }
             state["positions"].append(pos)
             existing_pairs.add(pair)
@@ -380,6 +443,18 @@ def open_from_signals(
             "realized_pnl_pct": None,
             "created_at": _now(),
             "entry_mode": mode,
+            "dca_size_units": 1.0,
+            "dca_levels_hit": [],
+            "first_notional_usd": notional,
+            "first_entry_px": entry_px if mode != "at_close" else (s.get("close") or entry_px),
+            "dca_legs": [{
+                "leg": 0,
+                "price": entry_px if mode != "at_close" else (s.get("close") or entry_px),
+                "notional_usd": notional,
+                "qty": order.get("qty"),
+                "order_id": order.get("orderId"),
+                "ts": _now(),
+            }],
         }
         state["positions"].append(pos)
         existing_pairs.add(pair)
@@ -491,6 +566,18 @@ def fill_opens(broker: BybitBroker | None = None, force_trade: bool = False) -> 
         p["entry_order_id"] = order.get("orderId")
         p["bars_held"] = 0
         p["filled_at"] = _now()
+        p["first_entry_px"] = mkt
+        p["first_notional_usd"] = notional
+        p["dca_size_units"] = 1.0
+        p["dca_levels_hit"] = []
+        p["dca_legs"] = [{
+            "leg": 0,
+            "price": mkt,
+            "notional_usd": notional,
+            "qty": order.get("qty"),
+            "order_id": order.get("orderId"),
+            "ts": _now(),
+        }]
         filled += 1
         summary["filled"].append({
             "id": p.get("id"),
@@ -515,6 +602,189 @@ def fill_opens(broker: BybitBroker | None = None, force_trade: bool = False) -> 
     print(f"Filled {filled} pending → open.")
     summary["filled_n"] = filled
     summary["equity"] = equity
+    return summary
+
+
+def process_dca(broker: BybitBroker | None = None, force_trade: bool = False) -> dict[str, Any]:
+    """
+    Soft DCA: if open short is adverse by DCA_LEVELS vs first entry, add short size
+    up to DCA_MAX_SIZE units. Blocked when account DD from peak >= DCA_BLOCK_DD.
+    """
+    br = broker or default_broker()
+    state = _load_state()
+    summary: dict[str, Any] = {
+        "added": [],
+        "skipped": [],
+        "blocked_dd": 0,
+        "enabled": bool(DCA_ENABLED),
+    }
+
+    if not DCA_ENABLED:
+        print("DCA disabled (DCA_ENABLED=False)")
+        return summary
+
+    ok_win, win_msg = in_trade_window(force=force_trade)
+    print(f"LIVE process_dca | {win_msg}")
+    if not ok_win:
+        summary["skipped"].append({"reason": "outside_window", "detail": win_msg})
+        print(f"  skip DCA exchange orders ({win_msg})")
+        return summary
+
+    killed, equity, reason = check_kill(br, state)
+    if killed:
+        print(f"KILL — no DCA ({reason})")
+        summary["killed"] = True
+        summary["kill_reason"] = reason
+        return summary
+
+    dd = _update_equity_peak(state, equity)
+    summary["equity"] = equity
+    summary["equity_dd"] = dd
+    print(f"  equity=${equity:.4f} peak=${state.get('equity_peak'):.4f} dd={dd*100:+.2f}%")
+
+    ohlc, _ = load_or_refresh(refresh=False)
+    today = _utc_now().strftime("%Y-%m-%d")
+    levels = tuple(float(x) for x in DCA_LEVELS)
+    added_n = 0
+
+    for p in state.get("positions", []):
+        if p.get("status") != "open":
+            continue
+        _init_dca_fields(p)
+        pair = p.get("pair") or ""
+        symbol = p.get("bybit_symbol") or kraken_to_bybit_symbol(pair)
+        entry_date = p.get("entry_date") or ""
+
+        # no DCA on entry day (same as backtest)
+        if entry_date and entry_date >= today:
+            summary["skipped"].append({"pair": pair, "reason": "entry_day"})
+            continue
+
+        size_u = float(p.get("dca_size_units") or 1.0)
+        if size_u >= float(DCA_MAX_SIZE) - 1e-9:
+            summary["skipped"].append({"pair": pair, "reason": "max_size", "size": size_u})
+            continue
+
+        first_px = float(p.get("first_entry_px") or p.get("entry_px") or 0)
+        first_notional = float(p.get("first_notional_usd") or p.get("notional_usd") or 0)
+        if first_px <= 0 or first_notional <= 0:
+            summary["skipped"].append({"pair": pair, "reason": "missing_first_px_or_notional"})
+            continue
+
+        try:
+            last_px = float(br.get_ticker_price(symbol))
+        except Exception as e:
+            summary["skipped"].append({"pair": pair, "reason": f"ticker_fail: {e}"})
+            continue
+
+        adverse = _adverse_vs_first(p, last_px, ohlc)
+        hit = set(int(x) for x in (p.get("dca_levels_hit") or []))
+
+        # account DD block
+        if DCA_BLOCK_DD is not None and dd <= -abs(float(DCA_BLOCK_DD)):
+            if any(adverse >= thr and i not in hit for i, thr in enumerate(levels)):
+                summary["blocked_dd"] += 1
+                summary["skipped"].append({
+                    "pair": pair,
+                    "reason": "account_dd_block",
+                    "dd": dd,
+                    "adverse": adverse,
+                })
+                print(f"  BLOCK DCA {pair}: account dd={dd*100:+.1f}% >= {float(DCA_BLOCK_DD)*100:.0f}%")
+            continue
+
+        for li, thr in enumerate(levels):
+            if li in hit:
+                continue
+            size_u = float(p.get("dca_size_units") or 1.0)
+            if size_u >= float(DCA_MAX_SIZE) - 1e-9:
+                break
+            if adverse < thr:
+                continue
+
+            add_units = min(float(DCA_ADD_SIZE), float(DCA_MAX_SIZE) - size_u)
+            if add_units <= 0:
+                break
+            add_notional = first_notional * add_units
+            if add_notional < 1.0:
+                summary["skipped"].append({
+                    "pair": pair,
+                    "reason": "add_notional_too_small",
+                    "notional": add_notional,
+                })
+                break
+
+            try:
+                order = br.open_short(symbol, add_notional)
+            except Exception as e:
+                print(f"  FAIL DCA {pair}→{symbol} +{thr*100:.0f}%: {e}")
+                summary["skipped"].append({"pair": pair, "reason": f"order_fail: {e}"})
+                _append_ledger({
+                    "ts": _now(),
+                    "event": "dca_failed",
+                    "pair": pair,
+                    "symbol": symbol,
+                    "threshold": thr,
+                    "error": str(e),
+                })
+                break
+
+            try:
+                fill_px = float(br.get_ticker_price(symbol))
+            except Exception:
+                fill_px = last_px
+
+            new_size = size_u + add_units
+            p["dca_size_units"] = new_size
+            hit.add(li)
+            p["dca_levels_hit"] = sorted(hit)
+            legs = list(p.get("dca_legs") or [])
+            legs.append({
+                "leg": len(legs),
+                "threshold": thr,
+                "price": fill_px,
+                "notional_usd": add_notional,
+                "qty": order.get("qty"),
+                "order_id": order.get("orderId"),
+                "ts": _now(),
+            })
+            p["dca_legs"] = legs
+            # total notional deployed (sum of legs) for display
+            p["notional_usd_total"] = sum(float(x.get("notional_usd") or 0) for x in legs)
+            p["last_dca_at"] = _now()
+            p["last_dca_threshold"] = thr
+            added_n += 1
+            summary["added"].append({
+                "id": p.get("id"),
+                "pair": pair,
+                "symbol": symbol,
+                "threshold": thr,
+                "adverse": adverse,
+                "add_notional": add_notional,
+                "size_units": new_size,
+                "orderId": order.get("orderId"),
+            })
+            _append_ledger({
+                "ts": _now(),
+                "event": "dca_add",
+                "pair": pair,
+                "symbol": symbol,
+                "threshold": thr,
+                "adverse": adverse,
+                "equity_dd": dd,
+                "add_notional": add_notional,
+                "size_units": new_size,
+                "order": {k: order.get(k) for k in ("orderId", "qty", "notional_usd", "symbol", "side")},
+                "position_id": p.get("id"),
+            })
+            print(
+                f"  DCA ADD {pair}→{symbol} thr=+{thr*100:.0f}% adverse={adverse*100:+.1f}% "
+                f"notional=${add_notional:.2f} size={new_size:.2f}x orderId={order.get('orderId')}"
+            )
+
+    _save_state(state)
+    summary["added_n"] = added_n
+    print(f"DCA done added={added_n} blocked_dd={summary['blocked_dd']}")
     return summary
 
 
@@ -662,11 +932,15 @@ def status(broker: BybitBroker | None = None) -> None:
 
     print(f"\n[OPEN] n={len(by.get('open') or [])}")
     for p in (by.get("open") or [])[-20:]:
+        _init_dca_fields(p)
+        dca_u = p.get("dca_size_units", 1.0)
+        hit = p.get("dca_levels_hit") or []
         print(
             f"  {p.get('id')} {p.get('pair'):<12} → {p.get('bybit_symbol')}  "
             f"entry={p.get('entry_date')} @ {p.get('entry_px')}  "
             f"bars={p.get('bars_held')}/{p.get('hold_days')}  "
-            f"notional=${p.get('notional_usd')} qty={p.get('qty')}"
+            f"notional1=${p.get('first_notional_usd') or p.get('notional_usd')} "
+            f"dca={dca_u}x hit={hit} qty={p.get('qty')}"
         )
 
     print(f"\n[CLOSED] n={len(by.get('closed') or [])}")
@@ -703,6 +977,8 @@ def main() -> None:
     p_close.add_argument("--force-trade", action="store_true", help="Ignore UTC trade window")
     p_fill = sub.add_parser("fill-opens")
     p_fill.add_argument("--force-trade", action="store_true")
+    p_dca = sub.add_parser("process-dca", help="Soft DCA adds on adverse shorts")
+    p_dca.add_argument("--force-trade", action="store_true")
     p_open = sub.add_parser("open-from-signals")
     p_open.add_argument("--force-trade", action="store_true")
     p_reset = sub.add_parser("reset")
@@ -715,6 +991,8 @@ def main() -> None:
         close_due(force_trade=args.force_trade)
     elif args.cmd == "fill-opens":
         fill_opens(force_trade=args.force_trade)
+    elif args.cmd == "process-dca":
+        process_dca(force_trade=args.force_trade)
     elif args.cmd == "open-from-signals":
         open_from_signals(force_trade=args.force_trade)
     elif args.cmd == "reset":

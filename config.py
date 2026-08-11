@@ -34,11 +34,11 @@ STRICT_VOL5 = False
 
 # =============================================================================
 # PROFIL A LIVE — risk 5% · 2x · max 4 · equity $55 · Bybit linear USDT
-#   notional = 10% equity / trade · gross max 40%
-#   Scan: Kraken USD alts · Exec: Bybit perps (AI sub-account)
-#   equity_start = 55 so dashboard PnL matches real deposit (e.g. $62 → +$7)
+#   + DCA soft: add short at +10%/+20% adverse, max size 2× first leg
+#   notional first leg = 10% equity · gross base max 40% (higher if DCA)
+#   Scan: Kraken USD alts · Exec: Bybit perps
 # =============================================================================
-PROFILE_NAME = "A_RISK5_L2_MAX4_LIVE"
+PROFILE_NAME = "A_RISK5_L2_MAX4_DCA_SOFT"
 
 EQUITY_USD = 55.0
 RISK_PCT_PER_TRADE = 0.05  # 5% margin per trade
@@ -47,6 +47,16 @@ LEVERAGE = 2
 MAX_OPEN_POSITIONS = 4
 COMPOUNDING = True
 FULL_AUTO = True
+
+# --- DCA soft (short into drawdown) ---
+# When price rises against the short after entry, add size (better short price),
+# capped. Time-exit still closes the entire position after HOLD_DAYS.
+DCA_ENABLED = True
+DCA_LEVELS = (0.10, 0.20)  # +10%, +20% vs first entry_px
+DCA_ADD_SIZE = 1.0  # each add = 1.0 × first-leg size units
+DCA_MAX_SIZE = 2.0  # total size units vs first leg (cap)
+DCA_BLOCK_DD = 0.35  # no DCA if account equity DD from peak >= 35%
+# Trigger: max(live last price, Kraken daily high since entry) vs entry_px
 
 # Execution mode: "paper" | "live"
 EXECUTION_MODE = "live"
@@ -136,11 +146,17 @@ def max_gross_exposure_usd(equity_usd: float = EQUITY_USD) -> float:
 
 def profile_summary() -> str:
     eq = EQUITY_USD
+    dca = (
+        f"DCA on +{'/'.join(f'{int(x*100)}%' for x in DCA_LEVELS)} "
+        f"add={DCA_ADD_SIZE}x max={DCA_MAX_SIZE}x block_dd={DCA_BLOCK_DD*100:.0f}%"
+        if DCA_ENABLED
+        else "DCA off"
+    )
     return (
         f"{PROFILE_NAME} | equity=${eq:.0f} | {MARGIN_MODE} {LEVERAGE}x | "
         f"risk {RISK_PCT_PER_TRADE*100:.0f}% (margin ${margin_usd(eq):.2f}, "
         f"notional ${position_notional(eq):.2f}) | max_pos={MAX_OPEN_POSITIONS} | "
         f"mode={EXECUTION_MODE} entry={ENTRY_MODE} "
         f"window={LIVE_TRADE_UTC_START_HOUR:02d}-{LIVE_TRADE_UTC_END_HOUR:02d}Z | "
-        f"auto={FULL_AUTO} compound={COMPOUNDING}"
+        f"auto={FULL_AUTO} compound={COMPOUNDING} | {dca}"
     )
