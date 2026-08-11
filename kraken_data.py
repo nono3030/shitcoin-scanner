@@ -87,6 +87,65 @@ def fetch_ohlc_rows(pair_key: str, interval: int = 1440) -> list[list]:
     return result[sk]
 
 
+# Kraken public OHLC intervals (minutes)
+KRAKEN_INTERVALS = {
+    1: "1m",
+    5: "5m",
+    15: "15m",
+    30: "30m",
+    60: "1h",
+    240: "4h",
+    1440: "1D",
+    10080: "1W",
+    21600: "15D",
+}
+
+
+def resolve_pair_key(wsname: str) -> str | None:
+    """Map 'SOL/USD' → Kraken AssetPairs key (e.g. SOLUSD)."""
+    want = (wsname or "").strip().upper().replace(" ", "")
+    if not want:
+        return None
+    # try direct altname-style
+    if "/" in want:
+        base, quote = want.split("/", 1)
+    else:
+        base, quote = want, "USD"
+    candidates = [
+        f"{base}{quote}",
+        f"{base}USD",
+        f"X{base}ZUSD" if len(base) <= 4 else f"{base}USD",
+        want.replace("/", ""),
+    ]
+    pairs = load_usd_alt_pairs()
+    by_ws = {p["wsname"].upper(): p["pair_key"] for p in pairs}
+    if want in by_ws or f"{base}/{quote}" in by_ws:
+        return by_ws.get(want) or by_ws.get(f"{base}/{quote}")
+    # match by altname / key suffix
+    for p in pairs:
+        if p["wsname"].upper() == f"{base}/USD":
+            return p["pair_key"]
+        alt = (p.get("altname") or "").upper()
+        if alt in candidates or p["pair_key"].upper() in candidates:
+            return p["pair_key"]
+    # last resort: query with pair=BASEUSD
+    return f"{base}USD"
+
+
+def fetch_ohlc_wsname(wsname: str, interval: int = 1440) -> list[Candle]:
+    """Fetch OHLC for a wsname (e.g. BMT/USD) at given interval minutes."""
+    if interval not in KRAKEN_INTERVALS:
+        raise ValueError(f"Unsupported interval {interval}; use {sorted(KRAKEN_INTERVALS)}")
+    key = resolve_pair_key(wsname)
+    if not key:
+        return []
+    rows = fetch_ohlc_rows(key, interval=interval)
+    if not rows and key.endswith("USD"):
+        # retry with X-prefix style
+        rows = fetch_ohlc_rows(key, interval=interval)
+    return rows_to_candles(rows)
+
+
 def rows_to_candles(rows: list[list]) -> list[Candle]:
     return [
         Candle(int(r[0]), float(r[1]), float(r[2]), float(r[3]),

@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from config import (
     BYBIT_ENV,
@@ -39,13 +39,127 @@ from config import (
     position_notional,
     profile_summary,
 )
-from kraken_data import Candle, load_or_refresh
+from kraken_data import (
+    KRAKEN_INTERVALS,
+    Candle,
+    fetch_ohlc_wsname,
+    load_or_refresh,
+)
 
 DASH_HTML = OUT_DIR / "dashboard.html"
 # Fly/Railway inject PORT; bind 0.0.0.0 in production so the proxy can reach us.
 PORT = int(__import__("os").environ.get("PORT", "8765"))
 BIND_HOST = __import__("os").environ.get("BIND_HOST", "127.0.0.1")
 CHART_BARS = 120  # daily bars shown on chart
+# Max bars returned per TF request (Kraken caps ~720)
+TF_BARS = {
+    15: 400,
+    60: 400,
+    240: 300,
+    1440: 200,
+}
+
+
+def snap_ts_to_series(series: list[Candle], date: str | None, prefer: str = "first") -> int | None:
+    """Map YYYY-MM-DD to a candle timestamp on this series (first/last bar of day)."""
+    if not date or not series:
+        return None
+    day_bars = [c for c in series if c.date == date]
+    if day_bars:
+        return day_bars[0].ts if prefer == "first" else day_bars[-1].ts
+    for c in series:
+        if c.date >= date:
+            return c.ts
+    return None
+
+
+def build_tf_payload(
+    pair: str,
+    interval: int,
+    positions: list[dict] | None = None,
+    signals: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Live-fetch Kraken OHLC for pair@interval + trade markers snapped to that TF."""
+    candles = fetch_ohlc_wsname(pair, interval=interval)
+    if not candles:
+        return {"ok": False, "error": f"no OHLC for {pair} interval={interval}", "pair": pair, "interval": interval}
+    n = TF_BARS.get(interval, 300)
+    series = candles[-n:]
+    positions = positions or []
+    signals = signals or []
+    pair_trades = [p for p in positions if p.get("pair") == pair]
+    markers = []
+    price_lines = []
+    for t in pair_trades:
+        sig_ts = snap_ts_to_series(series, t.get("signal_date"), "first")
+        ent_ts = snap_ts_to_series(series, t.get("entry_date"), "first")
+        ext_ts = snap_ts_to_series(series, t.get("exit_date"), "last")
+        if sig_ts:
+            markers.append({
+                "time": sig_ts, "position": "aboveBar", "color": "#f0b429",
+                "shape": "circle", "text": "SIG",
+            })
+        if ent_ts and t.get("entry_px"):
+            markers.append({
+                "time": ent_ts, "position": "aboveBar", "color": "#f07178",
+                "shape": "arrowDown", "text": f"SHORT {t.get('entry_px'):.4g}",
+            })
+            price_lines.append({
+                "price": float(t["entry_px"]), "color": "#f07178",
+                "title": f"Entry {t.get('id', '')}", "lineWidth": 1, "lineStyle": 2,
+            })
+        if ext_ts and t.get("exit_px"):
+            pnl = t.get("realized_pnl_pct") or t.get("u_pnl_pct")
+            pnl_s = f" {pnl*100:+.1f}%" if pnl is not None else ""
+            markers.append({
+                "time": ext_ts, "position": "belowBar", "color": "#3dd68c",
+                "shape": "arrowUp", "text": f"EXIT{pnl_s}",
+            })
+        # DCA legs as small markers if present
+        for leg in (t.get("dca_legs") or [])[1:]:
+            # no exact bar time — skip or use entry day
+            pass
+    for s in signals:
+        if s.get("pair") != pair:
+            continue
+        sts = snap_ts_to_series(series, s.get("signal_date"), "first")
+        if not sts:
+            continue
+        if any(m["time"] == sts and m.get("text") in ("SIG", "SCAN") for m in markers):
+            continue
+        markers.append({
+            "time": sts, "position": "aboveBar", "color": "#5b9dff",
+            "shape": "circle", "text": "SCAN",
+        })
+    markers.sort(key=lambda m: m["time"])
+    label = KRAKEN_INTERVALS.get(interval, f"{interval}m")
+    return {
+        "ok": True,
+        "pair": pair,
+        "interval": interval,
+        "interval_label": label,
+        "candles": candles_to_tv(series, n=len(series)),
+        "volumes": volume_to_tv(series, n=len(series)),
+        "markers": markers,
+        "priceLines": price_lines,
+        "trades": [
+            {
+                "id": t.get("id"),
+                "status": t.get("status"),
+                "signal_date": t.get("signal_date"),
+                "entry_date": t.get("entry_date"),
+                "exit_date": t.get("exit_date"),
+                "entry_px": t.get("entry_px"),
+                "exit_px": t.get("exit_px") or t.get("last_px"),
+                "pnl_pct": t.get("u_pnl_pct") if t.get("status") != "closed" else t.get("realized_pnl_pct"),
+                "pnl_usd": t.get("u_pnl_usd") if t.get("status") != "closed" else t.get("realized_pnl_usd"),
+            }
+            for t in pair_trades
+        ],
+        "last_close": series[-1].c,
+        "last_date": series[-1].date,
+        "n_bars": len(series),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1081,10 +1195,18 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
     <!-- CHART -->
     <div class="card span-12">
       <div class="chart-toolbar">
-        <h2 style="margin:0">Chart trades <span class="count">TradingView LWC · daily</span></h2>
+        <h2 style="margin:0">Chart trades <span class="count" id="chart-tf-label">TradingView LWC · 1D</span></h2>
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
           <label class="muted tiny" for="pair-select">Paire</label>
           <select id="pair-select" onchange="window.focusPair(this.value)">{pair_options}</select>
+          <label class="muted tiny" for="tf-select">TF</label>
+          <select id="tf-select" onchange="window.setTimeframe(this.value)">
+            <option value="15">15m</option>
+            <option value="60">1h</option>
+            <option value="240">4h</option>
+            <option value="1440" selected>1D</option>
+          </select>
+          <button type="button" class="btn-chart" id="tf-reload" onclick="window.reloadTimeframe()" title="Recharger OHLC">↻</button>
         </div>
       </div>
       <div class="legend">
@@ -1093,11 +1215,12 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
         <span><i style="background:#3dd68c"></i> Exit</span>
         <span><i style="background:#5b9dff"></i> Scan du jour</span>
         <span>Ligne pointillée rouge = prix d'entrée short</span>
+        <span class="muted">TF &lt; 1D = fetch Kraken live (serveur requis)</span>
       </div>
       <div id="tv-chart"></div>
       <div class="chart-meta" id="chart-meta">Sélectionne une paire…</div>
       <div class="trade-chips" id="trade-chips"></div>
-      <div class="hint">Clique une ligne de trade / signal dans les tableaux pour focus le chart. Scroll = zoom, drag = pan.</div>
+      <div class="hint">Clique une ligne de trade / signal pour focus. Change le TF (15m/1h/4h/1D). Scroll = zoom, drag = pan.</div>
     </div>
 
     <div class="card span-5">
@@ -1191,10 +1314,14 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
 
 <script>
 const CHARTS = {charts_json};
+const TF_LABELS = {{15: "15m", 60: "1h", 240: "4h", 1440: "1D"}};
 let currentPair = {default_pair};
+let currentInterval = 1440;
 let chart = null;
 let candleSeries = null;
 let volumeSeries = null;
+let loadingTf = false;
+const tfCache = {{}}; // key pair|interval -> data
 
 function fmtPct(x) {{
   if (x === null || x === undefined) return "—";
@@ -1214,19 +1341,51 @@ function highlightRows(pair) {{
   if (sel && pair) sel.value = pair;
 }}
 
-function renderTradeChips(pair) {{
+function applyChartData(pair, data, tfLabel) {{
+  if (!chart || !candleSeries || !data) return;
+  currentPair = pair;
+  candleSeries.setData(data.candles || []);
+  volumeSeries.setData(data.volumes || []);
+  candleSeries.setMarkers(data.markers || []);
+  if (candleSeries._fadeLines) {{
+    candleSeries._fadeLines.forEach(l => candleSeries.removePriceLine(l));
+  }}
+  candleSeries._fadeLines = [];
+  (data.priceLines || []).forEach(pl => {{
+    const line = candleSeries.createPriceLine({{
+      price: pl.price,
+      color: pl.color || "#f07178",
+      lineWidth: pl.lineWidth || 1,
+      lineStyle: pl.lineStyle !== undefined ? pl.lineStyle : 2,
+      axisLabelVisible: true,
+      title: pl.title || "Entry",
+    }});
+    candleSeries._fadeLines.push(line);
+  }});
+  chart.timeScale().fitContent();
+  // timeVisible for intraday
+  chart.timeScale().applyOptions({{ timeVisible: currentInterval < 1440, secondsVisible: false }});
+  highlightRows(pair);
+  renderTradeChips(pair, data, tfLabel);
+  const lab = document.getElementById("chart-tf-label");
+  if (lab) lab.textContent = "TradingView LWC · " + (tfLabel || TF_LABELS[currentInterval] || currentInterval);
+}}
+
+function renderTradeChips(pair, data, tfLabel) {{
   const el = document.getElementById("trade-chips");
   const meta = document.getElementById("chart-meta");
-  const data = CHARTS[pair];
+  data = data || CHARTS[pair];
   if (!data) {{
     el.innerHTML = "";
     meta.innerHTML = "Pas de données OHLC pour cette paire.";
     return;
   }}
+  const tf = tfLabel || data.interval_label || "1D";
   meta.innerHTML = `<strong>${{pair}}</strong>
+    <span>TF <strong>${{tf}}</strong></span>
     <span>Last ${{data.last_close}} <span class="muted">(${{data.last_date}})</span></span>
-    <span>${{data.candles.length}} bougies daily</span>
-    <span>${{(data.trades || []).length}} trade(s) paper</span>`;
+    <span>${{data.n_bars || (data.candles||[]).length}} bougies</span>
+    <span>${{(data.trades || []).length}} trade(s)</span>`;
 
   el.innerHTML = (data.trades || []).map(t => {{
     const cls = (t.pnl_pct || 0) >= 0 ? "pos" : "neg";
@@ -1284,48 +1443,78 @@ function initChart() {{
   }});
 }}
 
-function loadPair(pair) {{
+async function fetchTf(pair, interval, force) {{
+  const key = pair + "|" + interval;
+  if (!force && tfCache[key]) return tfCache[key];
+  // 1D: use embedded charts when available
+  if (Number(interval) === 1440 && CHARTS[pair] && !force) {{
+    const d = Object.assign({{ok: true, interval: 1440, interval_label: "1D", n_bars: (CHARTS[pair].candles||[]).length}}, CHARTS[pair]);
+    tfCache[key] = d;
+    return d;
+  }}
+  const meta = document.getElementById("chart-meta");
+  if (meta) meta.innerHTML = `<strong>${{pair}}</strong> <span class="muted">chargement TF ${{TF_LABELS[interval]||interval}}…</span>`;
+  const url = "/api/ohlc?pair=" + encodeURIComponent(pair) + "&interval=" + encodeURIComponent(interval);
+  const res = await fetch(url, {{ cache: "no-store" }});
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "fetch failed");
+  tfCache[key] = data;
+  return data;
+}}
+
+async function loadPair(pair, opts) {{
+  opts = opts || {{}};
   if (!chart || !candleSeries) return;
-  const data = CHARTS[pair];
-  if (!data) {{
-    renderTradeChips(pair);
-    return;
-  }}
+  if (!pair) return;
   currentPair = pair;
-  candleSeries.setData(data.candles);
-  volumeSeries.setData(data.volumes || []);
-  candleSeries.setMarkers(data.markers || []);
-
-  // clear old price lines by recreating series is heavy; use createPriceLine each time after reset
-  // Lightweight Charts: remove old lines by storing refs
-  if (candleSeries._fadeLines) {{
-    candleSeries._fadeLines.forEach(l => candleSeries.removePriceLine(l));
+  const interval = opts.interval != null ? Number(opts.interval) : currentInterval;
+  currentInterval = interval;
+  const tfSel = document.getElementById("tf-select");
+  if (tfSel) tfSel.value = String(interval);
+  try {{
+    loadingTf = true;
+    const data = await fetchTf(pair, interval, !!opts.force);
+    applyChartData(pair, data, data.interval_label || TF_LABELS[interval]);
+  }} catch (e) {{
+    console.error(e);
+    // fallback 1D embed
+    if (CHARTS[pair] && interval !== 1440) {{
+      currentInterval = 1440;
+      if (tfSel) tfSel.value = "1440";
+      applyChartData(pair, CHARTS[pair], "1D");
+      const meta = document.getElementById("chart-meta");
+      if (meta) meta.innerHTML += ` <span class="neg">· TF fetch fail (${{e.message}}), fallback 1D</span>`;
+    }} else if (CHARTS[pair]) {{
+      applyChartData(pair, CHARTS[pair], "1D");
+    }} else {{
+      document.getElementById("chart-meta").innerHTML = "Erreur chart: " + e.message;
+    }}
+  }} finally {{
+    loadingTf = false;
   }}
-  candleSeries._fadeLines = [];
-  (data.priceLines || []).forEach(pl => {{
-    const line = candleSeries.createPriceLine({{
-      price: pl.price,
-      color: pl.color || "#f07178",
-      lineWidth: pl.lineWidth || 1,
-      lineStyle: pl.lineStyle !== undefined ? pl.lineStyle : 2,
-      axisLabelVisible: true,
-      title: pl.title || "Entry",
-    }});
-    candleSeries._fadeLines.push(line);
-  }});
-
-  chart.timeScale().fitContent();
-  highlightRows(pair);
-  renderTradeChips(pair);
 }}
 
 window.focusPair = function(pair) {{
-  if (!pair || !CHARTS[pair]) {{
-    if (pair) alert("Pas de chart pour " + pair);
-    return;
+  if (!pair) return;
+  if (!CHARTS[pair] && currentInterval === 1440) {{
+    // still try lower TF fetch
   }}
   loadPair(pair);
   document.getElementById("tv-chart").scrollIntoView({{ behavior: "smooth", block: "center" }});
+}};
+
+window.setTimeframe = function(v) {{
+  const interval = Number(v) || 1440;
+  if (!currentPair) return;
+  loadPair(currentPair, {{ interval: interval }});
+}};
+
+window.reloadTimeframe = function() {{
+  if (!currentPair) return;
+  const key = currentPair + "|" + currentInterval;
+  delete tfCache[key];
+  loadPair(currentPair, {{ interval: currentInterval, force: true }});
 }};
 
 // boot
@@ -1420,14 +1609,89 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        # Multi-TF OHLC: /api/ohlc?pair=BMT/USD&interval=60
+        if path in ("/api/ohlc", "/ohlc"):
+            qs = parse_qs(parsed.query or "")
+            pair = (qs.get("pair") or [""])[0].strip()
+            try:
+                interval = int((qs.get("interval") or ["1440"])[0])
+            except ValueError:
+                interval = 1440
+            if interval not in KRAKEN_INTERVALS:
+                body = json.dumps({"ok": False, "error": f"bad interval {interval}"}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if not pair:
+                body = json.dumps({"ok": False, "error": "missing pair"}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            # attach trades/signals from lightweight payload (no full OHLC regen if possible)
+            try:
+                from config import CACHE_FILE
+                use_ohlc = CACHE_FILE.exists() and interval == 1440
+            except Exception:
+                use_ohlc = False
+            try:
+                base = build_payload(use_ohlc=use_ohlc)
+                positions = base.get("positions") or []
+                signals = base.get("signals") or []
+                # daily: serve embedded if present
+                if interval == 1440 and (base.get("charts") or {}).get(pair):
+                    ch = base["charts"][pair]
+                    payload = {
+                        "ok": True,
+                        "pair": pair,
+                        "interval": 1440,
+                        "interval_label": "1D",
+                        **ch,
+                        "n_bars": len(ch.get("candles") or []),
+                    }
+                else:
+                    payload = build_tf_payload(pair, interval, positions=positions, signals=signals)
+            except Exception as e:
+                payload = {"ok": False, "error": str(e), "pair": pair, "interval": interval}
+            body = json.dumps(payload, default=str).encode()
+            self.send_response(200 if payload.get("ok") else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path.startswith("/ohlc/"):
             pair = unquote(path[len("/ohlc/"):])
-            data = build_payload(use_ohlc=True)
-            chart = (data.get("charts") or {}).get(pair)
-            if not chart:
-                self.send_error(404, "pair not found")
+            # legacy path: /ohlc/PAIR?interval=
+            qs = parse_qs(parsed.query or "")
+            try:
+                interval = int((qs.get("interval") or ["1440"])[0])
+            except ValueError:
+                interval = 1440
+            base = {}
+            try:
+                base = build_payload(use_ohlc=True)
+                payload = build_tf_payload(
+                    pair, interval,
+                    positions=base.get("positions") or [],
+                    signals=base.get("signals") or [],
+                )
+            except Exception as e:
+                payload = {"ok": False, "error": str(e)}
+            if not payload.get("ok") and interval == 1440:
+                chart = (base.get("charts") or {}).get(pair)
+                if chart:
+                    payload = {"ok": True, "pair": pair, "interval": 1440, "interval_label": "1D", **chart}
+            if not payload.get("ok"):
+                self.send_error(404, payload.get("error") or "pair not found")
                 return
-            body = json.dumps(chart, default=str).encode()
+            body = json.dumps(payload, default=str).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
