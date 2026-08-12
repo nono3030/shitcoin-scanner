@@ -58,6 +58,12 @@ DCA_MAX_SIZE = 2.0  # total size units vs first leg (cap)
 DCA_BLOCK_DD = 0.35  # no DCA if account equity DD from peak >= 35%
 # Trigger: max(live last price, Kraken daily high since entry) vs entry_px
 
+# --- Re-entry / signal freshness guards ---
+# Do not re-open a pair closed within this many calendar days (UTC).
+COOLDOWN_DAYS_AFTER_CLOSE = 3
+# Ignore signals older than this many days vs UTC today (stale OHLC / delayed force fills).
+MAX_SIGNAL_AGE_DAYS = 1
+
 # Execution mode: "paper" | "live"
 EXECUTION_MODE = "live"
 

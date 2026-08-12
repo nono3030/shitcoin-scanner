@@ -31,6 +31,7 @@ from typing import Any
 
 from config import (
     COMPOUNDING,
+    COOLDOWN_DAYS_AFTER_CLOSE,
     DCA_ADD_SIZE,
     DCA_BLOCK_DD,
     DCA_ENABLED,
@@ -46,6 +47,7 @@ from config import (
     LIVE_TRADE_UTC_END_HOUR,
     LIVE_TRADE_UTC_START_HOUR,
     MAX_OPEN_POSITIONS,
+    MAX_SIGNAL_AGE_DAYS,
     MIN_EQUITY_USD,
     SIGNALS_FILE,
     active_rule,
@@ -119,6 +121,108 @@ def _append_ledger(event: dict[str, Any]) -> None:
 
 def _openish(state: dict[str, Any]) -> list[dict[str, Any]]:
     return [p for p in state.get("positions", []) if p.get("status") in ("pending", "open")]
+
+
+def _pair_in_cooldown(state: dict[str, Any], pair: str, as_of: date | None = None) -> tuple[bool, str]:
+    """True if pair was closed within COOLDOWN_DAYS_AFTER_CLOSE calendar days."""
+    today = as_of or _utc_now().date()
+    cd = int(COOLDOWN_DAYS_AFTER_CLOSE or 0)
+    if cd <= 0:
+        return False, ""
+    latest_exit: date | None = None
+    for p in state.get("positions") or []:
+        if p.get("pair") != pair or p.get("status") != "closed":
+            continue
+        ed = _parse_ymd(p.get("exit_date"))
+        if ed and (latest_exit is None or ed > latest_exit):
+            latest_exit = ed
+    if not latest_exit:
+        return False, ""
+    days_since = (today - latest_exit).days
+    if days_since < cd:
+        return True, f"cooldown {days_since}d<{cd}d since close {latest_exit.isoformat()}"
+    return False, ""
+
+
+def _signal_is_fresh(signal_date: str | None, as_of: date | None = None) -> tuple[bool, str]:
+    """Reject stale signal_date (e.g. OHLC cache lag / force-fill of old scans)."""
+    sd = _parse_ymd(signal_date)
+    if not sd:
+        return False, "missing_signal_date"
+    today = as_of or _utc_now().date()
+    age = (today - sd).days
+    max_age = int(MAX_SIGNAL_AGE_DAYS if MAX_SIGNAL_AGE_DAYS is not None else 1)
+    if age < 0:
+        return False, f"signal_date_in_future {signal_date}"
+    if age > max_age:
+        return False, f"stale_signal age={age}d>max={max_age}d ({signal_date})"
+    return True, f"fresh age={age}d"
+
+
+def close_all_open(broker: BybitBroker | None = None, force_trade: bool = False) -> dict[str, Any]:
+    """Emergency: market-close every open book position on Bybit (full size)."""
+    br = broker or default_broker()
+    state = _load_state()
+    summary: dict[str, Any] = {"closed": [], "failed": []}
+    ok_win, win_msg = in_trade_window(force=force_trade)
+    print(f"LIVE close_all_open | {win_msg}")
+    if not ok_win:
+        summary["skipped_window"] = win_msg
+        print(f"  abort: {win_msg}")
+        return summary
+
+    for p in state.get("positions", []):
+        if p.get("status") != "open":
+            continue
+        pair = p.get("pair") or ""
+        symbol = p.get("bybit_symbol") or kraken_to_bybit_symbol(pair)
+        try:
+            order = br.close_short(symbol, qty=None)
+        except Exception as e:
+            print(f"  FAIL close {pair}: {e}")
+            summary["failed"].append({"pair": pair, "error": str(e)})
+            _append_ledger({"ts": _now(), "event": "close_all_failed", "pair": pair, "error": str(e)})
+            continue
+        try:
+            exit_px = br.get_ticker_price(symbol)
+        except Exception:
+            exit_px = p.get("entry_px")
+        entry_px = p.get("first_entry_px") or p.get("entry_px")
+        legs = p.get("dca_legs") or []
+        if legs:
+            den = sum(float(lg.get("notional_usd") or 0) for lg in legs)
+            num = sum(float(lg.get("price") or 0) * float(lg.get("notional_usd") or 0) for lg in legs)
+            entry_px = (num / den) if den > 0 else entry_px
+            notional = den
+        else:
+            notional = float(p.get("first_notional_usd") or p.get("notional_usd") or 0) * float(
+                p.get("dca_size_units") or 1.0
+            )
+        net = None
+        pnl_usd = None
+        if entry_px and exit_px and float(entry_px) > 0:
+            net = (float(entry_px) - float(exit_px)) / float(entry_px)
+            pnl_usd = net * float(notional or 0)
+        p["status"] = "closed"
+        p["exit_date"] = _utc_now().strftime("%Y-%m-%d")
+        p["exit_px"] = exit_px
+        p["exit_order_id"] = order.get("orderId")
+        p["realized_pnl_pct"] = net
+        p["realized_pnl_usd"] = pnl_usd
+        p["exit_reason"] = "force_close_all"
+        p["bars_held"] = _calendar_bars_held(p.get("entry_date"))
+        if pnl_usd is not None:
+            state["cash_pnl"] = float(state.get("cash_pnl") or 0.0) + pnl_usd
+        summary["closed"].append({"pair": pair, "symbol": symbol, "pnl_usd": pnl_usd, "orderId": order.get("orderId")})
+        _append_ledger({"ts": _now(), "event": "force_closed", "position": dict(p)})
+        print(
+            f"  FORCE CLOSED {pair}→{symbol} entry={entry_px} exit={exit_px} "
+            f"pnl%={(net or 0)*100:+.2f}% pnl$={(pnl_usd or 0):+.2f}"
+        )
+    _save_state(state)
+    summary["closed_n"] = len(summary["closed"])
+    print(f"Force-closed {summary['closed_n']}. est_cash_pnl=${state.get('cash_pnl', 0):+.2f}")
+    return summary
 
 
 def _parse_ymd(s: str | None) -> date | None:
@@ -378,6 +482,18 @@ def open_from_signals(
             continue
 
         signal_date = s.get("signal_date")
+        fresh_ok, fresh_msg = _signal_is_fresh(signal_date)
+        if not fresh_ok:
+            summary["skipped"].append({"pair": pair, "reason": fresh_msg, "signal_date": signal_date})
+            print(f"  skip {pair}: {fresh_msg}")
+            continue
+        cool_ok, cool_msg = _pair_in_cooldown(state, pair)
+        # cool_ok True means IN cooldown → skip
+        if cool_ok:
+            summary["skipped"].append({"pair": pair, "reason": cool_msg})
+            print(f"  skip {pair}: {cool_msg}")
+            continue
+
         series = ohlc.get(pair) or []
         last_closed = _last_closed_date(series)
 
@@ -1064,6 +1180,8 @@ def main() -> None:
     p_open.add_argument("--force-trade", action="store_true")
     p_reset = sub.add_parser("reset")
     p_reset.add_argument("--force", action="store_true")
+    p_call = sub.add_parser("close-all-open", help="Force market-close all open positions")
+    p_call.add_argument("--force-trade", action="store_true")
     args = ap.parse_args()
 
     if args.cmd == "status":
@@ -1076,6 +1194,8 @@ def main() -> None:
         process_dca(force_trade=args.force_trade)
     elif args.cmd == "open-from-signals":
         open_from_signals(force_trade=args.force_trade)
+    elif args.cmd == "close-all-open":
+        close_all_open(force_trade=args.force_trade)
     elif args.cmd == "reset":
         reset(force=args.force)
 
