@@ -26,7 +26,7 @@ import argparse
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from config import (
@@ -121,13 +121,45 @@ def _openish(state: dict[str, Any]) -> list[dict[str, Any]]:
     return [p for p in state.get("positions", []) if p.get("status") in ("pending", "open")]
 
 
+def _parse_ymd(s: str | None) -> date | None:
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(str(s)[:10])
+    except ValueError:
+        return None
+
+
+def _calendar_bars_held(entry_date: str | None, as_of: date | None = None) -> int:
+    """
+    Hold counter independent of OHLC cache freshness.
+
+    Entry day counts as bar 1 (matches backtest: entry bar included in hold).
+    bars_held = (as_of_utc_date - entry_date).days + 1
+    """
+    ed = _parse_ymd(entry_date)
+    if not ed:
+        return 0
+    today = as_of or _utc_now().date()
+    if today < ed:
+        return 0
+    return (today - ed).days + 1
+
+
 def _bars_since_entry(pair: str, entry_date: str, ohlc: dict) -> tuple[int, float | None, str | None]:
+    """
+    Returns (bars_held, last_close_or_None, last_date).
+    bars_held uses calendar UTC (robust); last price still from OHLC if present.
+    """
+    n = _calendar_bars_held(entry_date)
     series = ohlc.get(pair) or []
-    bars = [c for c in series if c.date >= entry_date]
-    if not bars:
-        return 0, None, None
-    last = bars[-1]
-    return len(bars), last.c, last.date
+    bars = [c for c in series if c.date >= (entry_date or "")]
+    if bars:
+        last = bars[-1]
+        return n, last.c, last.date
+    # no OHLC: still return calendar count
+    today = _utc_now().strftime("%Y-%m-%d")
+    return n, None, today
 
 
 def _last_closed_date(series: list) -> str | None:
@@ -142,11 +174,34 @@ def _last_closed_date(series: list) -> str | None:
 
 
 def _entry_bar_after_signal(pair: str, signal_date: str, ohlc: dict):
-    """First daily bar strictly after signal_date (= next open for time-series)."""
+    """
+    First daily bar strictly after signal_date (= next open for time-series).
+
+    If OHLC cache is stale but calendar says next day has started, return a
+    lightweight synthetic bar (date only, open=None) so fill_opens can proceed
+    with market price.
+    """
     series = ohlc.get(pair) or []
     for c in series:
         if c.date > signal_date:
             return c
+    # Calendar fallback: next open exists if UTC today > signal_date
+    sig = _parse_ymd(signal_date)
+    if not sig:
+        return None
+    today = _utc_now().date()
+    if today > sig:
+        entry_d = sig + timedelta(days=1)
+        # synthetic candle-like object
+        class _Syn:
+            pass
+
+        syn = _Syn()
+        syn.date = entry_d.isoformat()
+        syn.o = None  # force market price
+        syn.h = syn.l = syn.c = None
+        syn.ts = int(datetime(entry_d.year, entry_d.month, entry_d.day, tzinfo=timezone.utc).timestamp())
+        return syn
     return None
 
 
@@ -551,20 +606,26 @@ def fill_opens(broker: BybitBroker | None = None, force_trade: bool = False) -> 
             _append_ledger({"ts": _now(), "event": "fill_failed", "pair": pair, "symbol": symbol, "error": str(e)})
             continue
 
-        entry_px = float(entry_bar.o)  # theoretical next open
+        open_ref = getattr(entry_bar, "o", None)
         try:
-            # live fill is market; keep open as reference, store both
+            open_ref_f = float(open_ref) if open_ref is not None else None
+        except (TypeError, ValueError):
+            open_ref_f = None
+        try:
             mkt = br.get_ticker_price(symbol)
         except Exception:
-            mkt = entry_px
+            mkt = open_ref_f
+        if mkt is None:
+            summary["skipped"].append({"pair": pair, "reason": "no_price_for_fill"})
+            continue
 
         p["status"] = "open"
         p["entry_date"] = entry_bar.date
         p["entry_px"] = mkt
-        p["entry_px_open_ref"] = entry_px
+        p["entry_px_open_ref"] = open_ref_f
         p["qty"] = order.get("qty")
         p["entry_order_id"] = order.get("orderId")
-        p["bars_held"] = 0
+        p["bars_held"] = _calendar_bars_held(entry_bar.date)
         p["filled_at"] = _now()
         p["first_entry_px"] = mkt
         p["first_notional_usd"] = notional
@@ -595,7 +656,8 @@ def fill_opens(broker: BybitBroker | None = None, force_trade: bool = False) -> 
         })
         print(
             f"  FILLED short {pair}→{symbol} entry_date={p['entry_date']} "
-            f"open_ref={entry_px} mkt={mkt} qty={p['qty']} orderId={order.get('orderId')}"
+            f"open_ref={open_ref_f} mkt={mkt} bars={p['bars_held']} "
+            f"qty={p['qty']} orderId={order.get('orderId')}"
         )
 
     _save_state(state)
@@ -811,7 +873,14 @@ def close_due(broker: BybitBroker | None = None, force_trade: bool = False) -> d
         p["bars_held"] = n
         hold = int(p.get("hold_days") or HOLD_DAYS)
         if n < hold:
-            summary["held"].append({"pair": pair, "bars": n, "hold": hold})
+            summary["held"].append({
+                "pair": pair,
+                "bars": n,
+                "hold": hold,
+                "entry_date": entry_date,
+                "calendar": True,
+            })
+            print(f"  hold {pair}: bars={n}/{hold} (calendar UTC from {entry_date})")
             continue
 
         if not ok_win:
@@ -820,65 +889,74 @@ def close_due(broker: BybitBroker | None = None, force_trade: bool = False) -> d
             continue
 
         symbol = p.get("bybit_symbol") or kraken_to_bybit_symbol(pair)
-        qty = p.get("qty")
+        # Always close FULL exchange position (includes DCA adds; book qty may be 1st leg only)
         try:
-            order = br.close_short(symbol, qty=qty)
+            order = br.close_short(symbol, qty=None)
         except Exception as e:
-            try:
-                order = br.close_short(symbol, qty=None)
-            except Exception as e2:
-                print(f"  FAIL close {pair}→{symbol}: {e2}")
-                _append_ledger({
-                    "ts": _now(),
-                    "event": "close_failed",
-                    "pair": pair,
-                    "symbol": symbol,
-                    "error": str(e2),
-                    "prev_error": str(e),
-                })
-                continue
+            print(f"  FAIL close {pair}→{symbol}: {e}")
+            _append_ledger({
+                "ts": _now(),
+                "event": "close_failed",
+                "pair": pair,
+                "symbol": symbol,
+                "error": str(e),
+            })
+            continue
 
-        # Prefer hold_days-th bar close for bookkeeping
+        # Bookkeeping: prefer OHLC ref if present, else live ticker + calendar exit date
         series = ohlc.get(pair) or []
         bars = [c for c in series if c.date >= entry_date]
         exit_bar = bars[hold - 1] if len(bars) >= hold else (bars[-1] if bars else None)
         exit_px_ref = exit_bar.c if exit_bar else last_c
-        exit_date = exit_bar.date if exit_bar else last_d
+        exit_date = _utc_now().strftime("%Y-%m-%d")
 
         try:
             exit_px = br.get_ticker_price(symbol)
         except Exception:
             exit_px = exit_px_ref
 
-        entry_px = p.get("entry_px")
+        # Avg entry across DCA legs when available
+        legs = p.get("dca_legs") or []
+        if legs:
+            num = sum(float(lg.get("price") or 0) * float(lg.get("notional_usd") or 0) for lg in legs)
+            den = sum(float(lg.get("notional_usd") or 0) for lg in legs)
+            entry_px = (num / den) if den > 0 else p.get("entry_px")
+            notional = den if den > 0 else float(p.get("notional_usd") or 0)
+        else:
+            entry_px = p.get("entry_px")
+            size_u = float(p.get("dca_size_units") or 1.0)
+            first_n = float(p.get("first_notional_usd") or p.get("notional_usd") or 0)
+            notional = first_n * size_u
+
         net = None
         pnl_usd = None
         if entry_px and exit_px and float(entry_px) > 0:
-            gross = (float(entry_px) - float(exit_px)) / float(entry_px)
-            net = gross
-            notional = float(p.get("notional_usd") or 0)
-            pnl_usd = net * notional
+            net = (float(entry_px) - float(exit_px)) / float(entry_px)
+            pnl_usd = net * float(notional or 0)
 
         p["status"] = "closed"
-        p["exit_date"] = exit_date or _utc_now().strftime("%Y-%m-%d")
+        p["exit_date"] = exit_date
         p["exit_px"] = exit_px
         p["exit_px_close_ref"] = exit_px_ref
         p["exit_order_id"] = order.get("orderId")
         p["realized_pnl_pct"] = net
         p["realized_pnl_usd"] = pnl_usd
         p["exit_reason"] = "time_exit"
+        p["bars_held"] = n
         if pnl_usd is not None:
             state["cash_pnl"] = float(state.get("cash_pnl") or 0.0) + pnl_usd
         closed += 1
         summary["closed"].append({
             "pair": pair,
             "symbol": symbol,
+            "bars": n,
+            "hold": hold,
             "pnl_usd": pnl_usd,
             "orderId": order.get("orderId"),
         })
         _append_ledger({"ts": _now(), "event": "closed_time_exit", "position": dict(p)})
         print(
-            f"  CLOSED {pair}→{symbol} bars={n}/{hold} "
+            f"  CLOSED {pair}→{symbol} bars={n}/{hold} (calendar) "
             f"entry={entry_px} exit={exit_px} "
             f"pnl%={(net or 0)*100:+.2f}% pnl$={(pnl_usd or 0):+.2f} "
             f"orderId={order.get('orderId')}"
@@ -935,10 +1013,13 @@ def status(broker: BybitBroker | None = None) -> None:
         _init_dca_fields(p)
         dca_u = p.get("dca_size_units", 1.0)
         hit = p.get("dca_levels_hit") or []
+        bh = _calendar_bars_held(p.get("entry_date"))
+        p["bars_held"] = bh
+        hold = int(p.get("hold_days") or HOLD_DAYS)
         print(
             f"  {p.get('id')} {p.get('pair'):<12} → {p.get('bybit_symbol')}  "
             f"entry={p.get('entry_date')} @ {p.get('entry_px')}  "
-            f"bars={p.get('bars_held')}/{p.get('hold_days')}  "
+            f"bars={bh}/{hold} (calendar UTC)  "
             f"notional1=${p.get('first_notional_usd') or p.get('notional_usd')} "
             f"dca={dca_u}x hit={hit} qty={p.get('qty')}"
         )

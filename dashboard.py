@@ -279,20 +279,36 @@ def enrich_positions(state: dict, ohlc: dict | None) -> list[dict]:
         r["exchange_synced"] = None
         r["pnl_source"] = "local"
 
+        entry_date = r.get("entry_date") or ""
+        # Hold progress: calendar UTC days (not OHLC cache length — cache can be stale)
+        if r.get("status") in ("open", "pending") and entry_date:
+            try:
+                from datetime import date as _date
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
+
+                ed = _date.fromisoformat(str(entry_date)[:10])
+                today = _dt.now(_tz.utc).date()
+                r["bars_held"] = max(0, (today - ed).days + 1) if today >= ed else 0
+            except ValueError:
+                pass
+
         if r.get("status") == "open" and ohlc and r.get("pair") in ohlc and r.get("entry_px"):
             series = ohlc[r["pair"]]
-            entry_date = r.get("entry_date") or ""
             bars = [c for c in series if c.date >= entry_date]
             if bars:
                 last = bars[-1]
                 r["last_px"] = last.c
                 r["last_date"] = last.date
-                r["bars_held"] = len(bars)
-                gross = _short_pnl(float(r["entry_px"]), last.c)
-                net = gross - FEE_RT / 2
-                r["u_pnl_pct"] = net
-                r["u_pnl_usd"] = net * float(r.get("notional_usd") or 0)
-                r["pnl_source"] = "kraken_ohlc"
+                # price mark from OHLC; bars_held already calendar above
+                if r.get("pnl_source") != "bybit":
+                    gross = _short_pnl(float(r["entry_px"]), last.c)
+                    net = gross - FEE_RT / 2
+                    r["u_pnl_pct"] = net
+                    size_u = float(r.get("dca_size_units") or 1.0)
+                    first_n = float(r.get("first_notional_usd") or r.get("notional_usd") or 0)
+                    r["u_pnl_usd"] = net * first_n * size_u
+                    r["pnl_source"] = "kraken_ohlc"
         elif r.get("status") == "closed":
             r["u_pnl_pct"] = r.get("realized_pnl_pct")
             r["u_pnl_usd"] = r.get("realized_pnl_usd")
