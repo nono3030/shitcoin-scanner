@@ -188,18 +188,60 @@ def load_cache() -> tuple[dict[str, list[Candle]], dict]:
     return ohlc, raw
 
 
+def _cache_age_hours() -> float | None:
+    """Age of OHLC cache file in hours, or None if missing/unreadable."""
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        raw = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        gen = raw.get("generated_at")
+        if gen:
+            # support ...Z and +00:00
+            ts = gen.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
+        # fallback: mtime
+        import os
+
+        return (time.time() - os.path.getmtime(CACHE_FILE)) / 3600.0
+    except Exception:
+        try:
+            import os
+
+            return (time.time() - os.path.getmtime(CACHE_FILE)) / 3600.0
+        except Exception:
+            return None
+
+
 def load_or_refresh(refresh: bool = False) -> tuple[dict[str, list[Candle]], list[dict]]:
+    import os
+
     pairs = load_usd_alt_pairs()
     meta = {p["wsname"]: p for p in pairs}
+
+    # Auto-refresh if cache is stale (daily job reliability for signal dates / holds)
+    age_h = _cache_age_hours()
+    max_age = None
+    try:
+        from config import OHLC_MAX_CACHE_AGE_HOURS
+
+        max_age = float(OHLC_MAX_CACHE_AGE_HOURS)
+    except Exception:
+        max_age = 20.0
+    if not refresh and age_h is not None and max_age is not None and age_h > max_age:
+        print(f"OHLC cache age {age_h:.1f}h > {max_age:.0f}h — forcing refresh")
+        refresh = True
+        os.environ["KRAKEN_ALLOW_FULL_DOWNLOAD"] = "1"
+
     if CACHE_FILE.exists() and not refresh:
-        print(f"Loading cache {CACHE_FILE}")
+        print(f"Loading cache {CACHE_FILE}" + (f" (age {age_h:.1f}h)" if age_h is not None else ""))
         ohlc, _ = load_cache()
         print(f"  {len(ohlc)} series")
         return ohlc, pairs
     # On Fly/cloud dashboard cold start: never download full universe unless forced.
     # Set KRAKEN_ALLOW_FULL_DOWNLOAD=1 (or refresh=True from run_daily --refresh).
-    import os
-
     allow = os.environ.get("KRAKEN_ALLOW_FULL_DOWNLOAD", "").strip() in ("1", "true", "yes")
     if not refresh and not allow:
         print(

@@ -28,6 +28,7 @@ from pathlib import Path
 from config import (
     BOT_LOG,
     COMPOUNDING,
+    COOLDOWN_DAYS_AFTER_CLOSE,
     ENTRY_MODE,
     EQUITY_USD,
     EXECUTION_MODE,
@@ -37,6 +38,7 @@ from config import (
     LIVE_TRADE_UTC_END_HOUR,
     LIVE_TRADE_UTC_START_HOUR,
     MAX_OPEN_POSITIONS,
+    MAX_SIGNAL_AGE_DAYS,
     MIN_EQUITY_USD,
     OUT_DIR,
     PAPER_STATE,
@@ -152,7 +154,8 @@ def step_live(signals: list[dict], dry: bool, force_trade: bool = False) -> None
         f"LIVE path | entry={ENTRY_MODE} | window "
         f"{LIVE_TRADE_UTC_START_HOUR:02d}-{LIVE_TRADE_UTC_END_HOUR:02d}Z | "
         f"{win_msg} | max_pos={MAX_OPEN_POSITIONS} compound={COMPOUNDING} "
-        f"min_eq=${MIN_EQUITY_USD} | {dca_txt}"
+        f"min_eq=${MIN_EQUITY_USD} | {dca_txt} | "
+        f"cooldown={COOLDOWN_DAYS_AFTER_CLOSE}d max_sig_age={MAX_SIGNAL_AGE_DAYS}d"
     )
     if not ok_win:
         log(
@@ -174,14 +177,21 @@ def step_live(signals: list[dict], dry: bool, force_trade: bool = False) -> None
         log(f"LIVE broker init/equity FAILED: {e}")
         raise
 
-    # 1) time exits first (free slots) — only hits exchange in trade window
+    # Pipeline order (scan already done before this step):
+    # 1) exits  2) fill pendings  3) DCA  4) queue new signals  5) fill again
+    # Hold uses calendar UTC days; close uses full Bybit size (DCA-safe).
+
+    # 1) time exits first (free slots) — calendar bars_held >= hold_days
     close_summary = close_due(broker=br, force_trade=force_trade)
     log(
         f"LIVE close_due closed={close_summary.get('closed_n', 0)} "
+        f"held={len(close_summary.get('held') or [])} "
         f"deferred={len(close_summary.get('deferred') or [])}"
     )
+    for h in (close_summary.get("held") or [])[:8]:
+        log(f"  hold {h.get('pair')} bars={h.get('bars')}/{h.get('hold')} entry={h.get('entry_date')}")
 
-    # 2) fill pending from previous days (next open ready)
+    # 2) fill pending from previous days (next open ready / calendar past signal)
     fill1 = fill_opens(broker=br, force_trade=force_trade)
     log(
         f"LIVE fill_opens#1 filled={fill1.get('filled_n', 0)} "
