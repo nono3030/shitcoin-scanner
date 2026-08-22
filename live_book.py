@@ -18,6 +18,8 @@ Usage:
   python live_book.py fill-opens
   python live_book.py open-from-signals
   python live_book.py open-from-signals --force-trade
+  python live_book.py expire-pending
+  python live_book.py catch-up
 """
 
 from __future__ import annotations
@@ -56,6 +58,8 @@ from config import (
 )
 from broker_bybit import BybitBroker, default_broker, kraken_to_bybit_symbol
 from kraken_data import load_or_refresh
+
+PENDING_MAX_FILL_FAILS = 2
 
 
 def _now() -> str:
@@ -157,6 +161,50 @@ def _signal_is_fresh(signal_date: str | None, as_of: date | None = None) -> tupl
     if age > max_age:
         return False, f"stale_signal age={age}d>max={max_age}d ({signal_date})"
     return True, f"fresh age={age}d"
+
+
+def expire_stale_pending(
+    state: dict[str, Any] | None = None,
+    save: bool = True,
+) -> dict[str, Any]:
+    """Drop pending that can never fill (stale signal, old queue, repeated fill fails).
+
+    Pending occupies a slot in `_openish` — a stuck queue deadlocks the whole book.
+    """
+    st = state if state is not None else _load_state()
+    today = _utc_now().date()
+    expired: list[dict[str, Any]] = []
+    for p in st.get("positions") or []:
+        if p.get("status") != "pending":
+            continue
+        reasons: list[str] = []
+        fresh_ok, fresh_msg = _signal_is_fresh(p.get("signal_date"), as_of=today)
+        if not fresh_ok:
+            reasons.append(fresh_msg)
+        created = p.get("created_at")
+        if created:
+            try:
+                cd = datetime.fromisoformat(str(created).replace("Z", "+00:00")).date()
+                age = (today - cd).days
+                if age >= 1:
+                    reasons.append(f"pending_age={age}d>=1d")
+            except (TypeError, ValueError):
+                pass
+        fails = int(p.get("fill_fails") or 0)
+        if fails >= PENDING_MAX_FILL_FAILS:
+            reasons.append(f"fill_fails={fails}")
+        if not reasons:
+            continue
+        p["status"] = "expired"
+        p["expired_at"] = _now()
+        p["expire_reason"] = "; ".join(reasons)
+        expired.append({"id": p.get("id"), "pair": p.get("pair"), "reason": p["expire_reason"]})
+        _append_ledger({"ts": _now(), "event": "pending_expired", "position": dict(p)})
+        print(f"  EXPIRED pending {p.get('pair')} id={p.get('id')} ({p['expire_reason']})")
+    if save:
+        _save_state(st)
+    print(f"Expired {len(expired)} stale pending.")
+    return {"expired_n": len(expired), "expired": expired}
 
 
 def close_all_open(broker: BybitBroker | None = None, force_trade: bool = False) -> dict[str, Any]:
@@ -718,8 +766,28 @@ def fill_opens(broker: BybitBroker | None = None, force_trade: bool = False) -> 
             order = br.open_short(symbol, notional)
         except Exception as e:
             print(f"  FAIL fill {pair}→{symbol}: {e}")
-            summary["skipped"].append({"pair": pair, "symbol": symbol, "reason": str(e)})
-            _append_ledger({"ts": _now(), "event": "fill_failed", "pair": pair, "symbol": symbol, "error": str(e)})
+            p["fill_fails"] = int(p.get("fill_fails") or 0) + 1
+            p["last_fill_error"] = str(e)
+            summary["skipped"].append({
+                "pair": pair,
+                "symbol": symbol,
+                "reason": str(e),
+                "fill_fails": p["fill_fails"],
+            })
+            _append_ledger({
+                "ts": _now(),
+                "event": "fill_failed",
+                "pair": pair,
+                "symbol": symbol,
+                "error": str(e),
+                "fill_fails": p["fill_fails"],
+            })
+            if p["fill_fails"] >= PENDING_MAX_FILL_FAILS:
+                p["status"] = "expired"
+                p["expired_at"] = _now()
+                p["expire_reason"] = f"fill_fails={p['fill_fails']}: {e}"
+                _append_ledger({"ts": _now(), "event": "pending_expired", "position": dict(p)})
+                print(f"  EXPIRED pending {pair} after {p['fill_fails']} fill fails")
             continue
 
         open_ref = getattr(entry_bar, "o", None)
@@ -780,6 +848,187 @@ def fill_opens(broker: BybitBroker | None = None, force_trade: bool = False) -> 
     print(f"Filled {filled} pending → open.")
     summary["filled_n"] = filled
     summary["equity"] = equity
+    return summary
+
+
+def catch_up_shorts(
+    signals: list[dict] | None = None,
+    n: int | None = None,
+    broker: BybitBroker | None = None,
+) -> dict[str, Any]:
+    """Rattrapage: expire stale pending, then market-open up to n ranked signals.
+
+    Always ignores the UTC trade window. Order failures skip to the next pair —
+    never leave a new pending (that's how the book deadlocked).
+    """
+    br = broker or default_broker()
+    state = _load_state()
+    target = int(n if n is not None else MAX_OPEN_POSITIONS)
+    expired = expire_stale_pending(state, save=True)
+    summary: dict[str, Any] = {
+        "expired": expired,
+        "opened": [],
+        "skipped": [],
+        "killed": False,
+        "target": target,
+    }
+
+    killed, equity, reason = check_kill(br, state)
+    summary["equity"] = equity
+    if killed:
+        summary["killed"] = True
+        summary["kill_reason"] = reason
+        print(f"KILL — catch-up aborted ({reason})")
+        return summary
+
+    if signals is None:
+        if not SIGNALS_FILE.exists():
+            summary["skipped"].append({"reason": "no_signals_file"})
+            print(f"No signals file at {SIGNALS_FILE}")
+            return summary
+        payload = json.loads(SIGNALS_FILE.read_text(encoding="utf-8"))
+        signals = payload.get("signals") or []
+
+    state = _load_state()
+    openish = _openish(state)
+    existing_pairs = {p["pair"] for p in openish}
+    existing_symbols = {p.get("bybit_symbol") for p in openish if p.get("bybit_symbol")}
+    try:
+        for ep in br.list_open_positions():
+            if ep.get("symbol"):
+                existing_symbols.add(ep["symbol"])
+    except Exception as e:
+        print(f"  warn: list_open_positions failed: {e}")
+
+    slots = max(0, target - len(openish))
+    print(
+        f"LIVE catch_up target={target} slots={slots} signals={len(signals)} "
+        f"expired={expired.get('expired_n')} equity=${equity:.2f}"
+    )
+    if slots == 0:
+        summary["skipped"].append({"reason": "no_slots"})
+        return summary
+
+    ranked = sorted(signals, key=lambda s: float(s.get("ret_3d") or 0.0), reverse=True)
+    rule = active_rule()
+    opened = 0
+    for s in ranked:
+        if opened >= slots:
+            break
+        pair = s.get("pair")
+        if not pair:
+            continue
+        if pair in existing_pairs:
+            summary["skipped"].append({"pair": pair, "reason": "already_tracked"})
+            continue
+        try:
+            symbol = kraken_to_bybit_symbol(pair)
+        except ValueError as e:
+            summary["skipped"].append({"pair": pair, "reason": f"map_fail: {e}"})
+            continue
+        if symbol in existing_symbols:
+            summary["skipped"].append({"pair": pair, "symbol": symbol, "reason": "already_on_exchange"})
+            continue
+        signal_date = s.get("signal_date")
+        fresh_ok, fresh_msg = _signal_is_fresh(signal_date)
+        if not fresh_ok:
+            summary["skipped"].append({"pair": pair, "reason": fresh_msg, "signal_date": signal_date})
+            continue
+
+        eq_for_size = _sizing_equity(br, state)
+        notional = position_notional(eq_for_size)
+        try:
+            order = br.open_short(symbol, notional)
+        except Exception as e:
+            print(f"  FAIL catch-up short {pair}→{symbol}: {e}")
+            summary["skipped"].append({"pair": pair, "symbol": symbol, "reason": str(e)})
+            _append_ledger({
+                "ts": _now(),
+                "event": "catchup_open_failed",
+                "pair": pair,
+                "symbol": symbol,
+                "error": str(e),
+            })
+            continue
+
+        try:
+            entry_px = br.get_ticker_price(symbol)
+        except Exception:
+            try:
+                entry_px = float(s.get("close") or 0) or None
+            except (TypeError, ValueError):
+                entry_px = None
+        entry_date = _utc_now().strftime("%Y-%m-%d")
+        pos = {
+            "id": str(uuid.uuid4())[:8],
+            "pair": pair,
+            "bybit_symbol": symbol,
+            "status": "open",
+            "side": "short",
+            "rule": rule.name,
+            "signal_date": signal_date,
+            "signal_close": s.get("close"),
+            "ret_3d": s.get("ret_3d"),
+            "rsi14": s.get("rsi14"),
+            "vol_spike": s.get("vol_spike"),
+            "dist_sma20": s.get("dist_sma20"),
+            "notional_usd": notional,
+            "qty": order.get("qty"),
+            "leverage": LEVERAGE,
+            "hold_days": int(s.get("hold_days") or HOLD_DAYS),
+            "entry_date": entry_date,
+            "entry_px": entry_px,
+            "entry_order_id": order.get("orderId"),
+            "exit_date": None,
+            "exit_px": None,
+            "exit_order_id": None,
+            "bars_held": _calendar_bars_held(entry_date),
+            "realized_pnl_usd": None,
+            "realized_pnl_pct": None,
+            "created_at": _now(),
+            "entry_mode": "catch_up",
+            "filled_at": _now(),
+            "dca_size_units": 1.0,
+            "dca_levels_hit": [],
+            "first_notional_usd": notional,
+            "first_entry_px": entry_px,
+            "dca_legs": [{
+                "leg": 0,
+                "price": entry_px,
+                "notional_usd": notional,
+                "qty": order.get("qty"),
+                "order_id": order.get("orderId"),
+                "ts": _now(),
+            }],
+        }
+        state["positions"].append(pos)
+        existing_pairs.add(pair)
+        existing_symbols.add(symbol)
+        opened += 1
+        summary["opened"].append({
+            "id": pos["id"],
+            "pair": pair,
+            "symbol": symbol,
+            "notional": notional,
+            "qty": order.get("qty"),
+            "orderId": order.get("orderId"),
+            "entry_px": entry_px,
+        })
+        _append_ledger({
+            "ts": _now(),
+            "event": "catchup_opened_short",
+            "position": pos,
+            "order": {k: order.get(k) for k in ("orderId", "qty", "notional_usd", "symbol", "side")},
+        })
+        print(
+            f"  CATCH-UP OPENED short {pair}→{symbol} id={pos['id']} "
+            f"qty={pos['qty']} notional=${notional:.2f} orderId={order.get('orderId')}"
+        )
+        _save_state(state)
+
+    summary["opened_n"] = opened
+    _save_state(state)
+    print(f"Catch-up done opened={opened}/{target}")
     return summary
 
 
@@ -1178,6 +1427,9 @@ def main() -> None:
     p_dca.add_argument("--force-trade", action="store_true")
     p_open = sub.add_parser("open-from-signals")
     p_open.add_argument("--force-trade", action="store_true")
+    p_exp = sub.add_parser("expire-pending", help="Drop stale pending that occupy slots")
+    p_cu = sub.add_parser("catch-up", help="Expire stale pending + market-open top N signals")
+    p_cu.add_argument("--n", type=int, default=None, help="How many shorts (default MAX_OPEN_POSITIONS)")
     p_reset = sub.add_parser("reset")
     p_reset.add_argument("--force", action="store_true")
     p_call = sub.add_parser("close-all-open", help="Force market-close all open positions")
@@ -1194,6 +1446,10 @@ def main() -> None:
         process_dca(force_trade=args.force_trade)
     elif args.cmd == "open-from-signals":
         open_from_signals(force_trade=args.force_trade)
+    elif args.cmd == "expire-pending":
+        expire_stale_pending()
+    elif args.cmd == "catch-up":
+        catch_up_shorts(n=args.n)
     elif args.cmd == "close-all-open":
         close_all_open(force_trade=args.force_trade)
     elif args.cmd == "reset":

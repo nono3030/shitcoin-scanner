@@ -11,9 +11,11 @@ Keeps one machine + one volume for both web and post-close trading job.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +43,41 @@ def _start_dashboard() -> None:
     serve(open_browser=False, host=host, port=port)
 
 
+def _maybe_catch_up() -> None:
+    """One-shot rattrapage after a pending deadlock. Stamp lives on the volume."""
+    flag = os.environ.get("CATCH_UP_ON_BOOT", "").strip().lower()
+    if flag not in ("1", "true", "yes"):
+        return
+    stamp = DATA_ROOT / "out" / "catchup_once.stamp"
+    if stamp.exists():
+        print(f"[entrypoint] catch-up already stamped ({stamp})", flush=True)
+        return
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    print("[entrypoint] CATCH_UP_ON_BOOT → run_daily --catch-up --force-trade", flush=True)
+    cmd = [
+        sys.executable,
+        str(APP_ROOT / "run_daily.py"),
+        "--no-refresh",
+        "--force-trade",
+        "--catch-up",
+        "--skip-dashboard",
+    ]
+    env = os.environ.copy()
+    env["DATA_ROOT"] = str(DATA_ROOT)
+    env["PYTHONPATH"] = str(APP_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    try:
+        proc = subprocess.run(cmd, cwd=str(APP_ROOT), env=env, check=False)
+        code = int(proc.returncode)
+    except Exception as e:
+        print(f"[entrypoint] catch-up FAILED spawn: {e}", flush=True)
+        code = 1
+    stamp.write_text(
+        f"{datetime.now(timezone.utc).isoformat()} exit={code}\n",
+        encoding="utf-8",
+    )
+    print(f"[entrypoint] catch-up done exit={code} stamped {stamp}", flush=True)
+
+
 def main() -> int:
     os.chdir(APP_ROOT)
     _ensure_dirs()
@@ -54,6 +91,11 @@ def main() -> int:
     t.start()
     # give health check a moment to bind
     time.sleep(1.5)
+    # one-shot rattrapage (expire stuck pending + 4 market shorts) — does not block health
+    try:
+        _maybe_catch_up()
+    except Exception as e:
+        print(f"[entrypoint] catch-up warn: {e}", flush=True)
 
     import importlib.util
 

@@ -136,6 +136,7 @@ def step_live(signals: list[dict], dry: bool, force_trade: bool = False) -> None
     from live_book import (
         check_kill,
         close_due,
+        expire_stale_pending,
         fill_opens,
         in_trade_window,
         open_from_signals,
@@ -177,9 +178,13 @@ def step_live(signals: list[dict], dry: bool, force_trade: bool = False) -> None
         log(f"LIVE broker init/equity FAILED: {e}")
         raise
 
-    # Pipeline order (scan already done before this step):
-    # 1) exits  2) fill pendings  3) DCA  4) queue new signals  5) fill again
-    # Hold uses calendar UTC days; close uses full Bybit size (DCA-safe).
+    # 0) free slots occupied by stale pending (deadlock: FUN/PRCL/PEP/PIPE age > 1d)
+    exp = expire_stale_pending()
+    log(
+        f"LIVE expire_stale_pending expired={exp.get('expired_n', 0)}"
+    )
+    for e in (exp.get("expired") or [])[:8]:
+        log(f"  expired {e.get('pair')} {e.get('reason')}")
 
     # 1) time exits first (free slots) — calendar bars_held >= hold_days
     close_summary = close_due(broker=br, force_trade=force_trade)
@@ -246,6 +251,27 @@ def step_live(signals: list[dict], dry: bool, force_trade: bool = False) -> None
         )
 
 
+def step_catch_up(signals: list[dict], dry: bool, n: int | None = None) -> None:
+    if dry:
+        log("CATCH-UP dry-run — skip expire/open")
+        return
+    from live_book import catch_up_shorts
+
+    log(f"CATCH-UP rattrapage n={n or MAX_OPEN_POSITIONS} (force window, no pending)")
+    summary = catch_up_shorts(signals, n=n)
+    log(
+        f"CATCH-UP expired={summary.get('expired', {}).get('expired_n', 0)} "
+        f"opened={summary.get('opened_n', 0)} killed={summary.get('killed', False)}"
+    )
+    for o in summary.get("opened") or []:
+        log(
+            f"  opened {o.get('pair')}→{o.get('symbol')} "
+            f"notional=${o.get('notional')} qty={o.get('qty')} order={o.get('orderId')}"
+        )
+    for s in (summary.get("skipped") or [])[:12]:
+        log(f"  skipped {s}")
+
+
 def step_execution(signals: list[dict], dry: bool, force_trade: bool = False) -> None:
     mode = (EXECUTION_MODE or "").strip().lower()
     if mode == "live":
@@ -279,6 +305,11 @@ def main() -> int:
         action="store_true",
         help="Live: ignore UTC post-close window (fills/closes anytime)",
     )
+    ap.add_argument(
+        "--catch-up",
+        action="store_true",
+        help="Expire stale pending then market-open top MAX_OPEN_POSITIONS signals now",
+    )
     args = ap.parse_args()
 
     refresh = REFRESH_OHLC_ON_RUN
@@ -292,12 +323,15 @@ def main() -> int:
     log(f"rule={active_rule().describe()}")
     log(
         f"hold_days={HOLD_DAYS} | EXECUTION_MODE={EXECUTION_MODE} | "
-        f"ENTRY_MODE={ENTRY_MODE} | force_trade={args.force_trade}"
+        f"ENTRY_MODE={ENTRY_MODE} | force_trade={args.force_trade} | catch_up={args.catch_up}"
     )
 
     try:
         signals = step_scan(refresh=refresh)
-        step_execution(signals, dry=args.dry_run, force_trade=args.force_trade)
+        if args.catch_up:
+            step_catch_up(signals, dry=args.dry_run)
+        else:
+            step_execution(signals, dry=args.dry_run, force_trade=args.force_trade)
         if not args.skip_dashboard:
             step_dashboard()
         log("RUN_DAILY OK")

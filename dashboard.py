@@ -922,6 +922,8 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
             return f'<tr><td colspan="{cols}" class="muted">Aucune position {status}</td></tr>'
         if status == "open":
             xs = sorted(xs, key=lambda p: p.get("u_pnl_usd") or 0, reverse=True)
+        elif status == "pending":
+            xs = sorted(xs, key=lambda p: p.get("signal_date") or p.get("created_at") or "", reverse=True)
         else:
             xs = sorted(xs, key=lambda p: p.get("exit_date") or "", reverse=True)
         html = []
@@ -957,7 +959,7 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
               <td><span class="tag {status}">{status}</span></td>
               <td class="pair">{pair}</td>
               {extra}
-              <td class="mono">{p.get("entry_date") or "—"}</td>
+              <td class="mono">{p.get("entry_date") or p.get("signal_date") or "—"}</td>
               <td class="mono">{_px(entry_show)}</td>
               <td class="mono">{_px(p.get("last_px"))}</td>
               <td>
@@ -1044,6 +1046,12 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
         <div class="year-grid">{years}</div>'''
 
     total_cls = _cls(s.get("total_pnl"))
+    pending_note = ""
+    if live and (s.get("n_pending") or 0) > 0 and (s.get("n_open") or 0) == 0:
+        pending_note = (
+            f' <strong class="warn">Pending: {s.get("n_pending", 0)} '
+            "slot(s) bloquent de nouvelles entrees (expires si signal > 1j).</strong>"
+        )
 
     return f'''<!DOCTYPE html>
 <html lang="fr">
@@ -1107,6 +1115,7 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
   .tag.open {{ background:rgba(91,157,255,0.15); color:var(--accent); }}
   .tag.closed {{ background:rgba(139,155,176,0.15); color:var(--muted); }}
   .tag.pending {{ background:rgba(240,180,41,0.15); color:var(--warn); }}
+  .tag.expired {{ background:rgba(240,113,120,0.15); color:var(--neg); }}
   .bar {{ height:6px; background:#1c2736; border-radius:99px; overflow:hidden; width:72px; display:inline-block; vertical-align:middle; margin-right:6px; }}
   .bar > div {{ height:100%; background:linear-gradient(90deg,var(--accent),#8b7bff); }}
   .spark {{ width:100%; height:64px; display:block; }}
@@ -1183,6 +1192,7 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
     · {s.get('n_local_only',0)} local-only · {s.get('n_exchange_only',0)} exchange-only.
     {(' <strong class="neg">API: ' + str(ex.get('error')) + '</strong>') if ex.get('error') else ''}
     {(' <strong class="neg">KILL: ' + str(data.get('kill_reason')) + '</strong>') if data.get('killed') else ''}
+    {pending_note}
   </div>
   ''')}
 
@@ -1266,6 +1276,22 @@ def render_html(data: dict, auto_refresh: bool = False) -> str:
           <th>Hold</th><th>Notional</th><th>P&amp;L %</th><th>P&amp;L $</th><th></th>
         </tr></thead>
         <tbody>{pos_rows("open")}</tbody>
+      </table>
+    </div>
+
+    <div class="card span-12">
+      <h2>Pending (file d'attente next open) <span class="count">{s.get("n_pending", 0)}</span></h2>
+      <div class="muted tiny" style="margin-bottom:8px">
+        Un pending occupe un slot (max {s.get("max_open", 4)}). Signal > 1 jour ou 2 fills Bybit ratés → expired, slot libéré.
+      </div>
+      <table>
+        <thead><tr>
+          <th>Statut</th><th>Pair</th>
+          {('<th>Bybit</th><th>Size</th><th>Sync</th>' if live else '')}
+          <th>Signal</th><th>Px in</th><th>Mark/Last</th>
+          <th>Hold</th><th>Notional</th><th>P&L %</th><th>P&L $</th><th></th>
+        </tr></thead>
+        <tbody>{pos_rows("pending")}</tbody>
       </table>
     </div>
 

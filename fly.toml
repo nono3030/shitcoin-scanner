@@ -21,6 +21,7 @@ primary_region = "sin"
   PYTHONPATH = "/app"
   DAILY_RUN_UTC_HOUR = "0"
   DAILY_RUN_UTC_MINUTE = "15"
+  CATCH_UP_ON_BOOT = "1"
 
 [http_service]
   internal_port = 8080
